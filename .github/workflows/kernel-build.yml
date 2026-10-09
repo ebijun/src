@@ -21,7 +21,6 @@ jobs:
 
       - name: Build Tools and Kernel (earmv7hf)
         run: |
-          # 非特権ユーザービルド用に -U フラグを追加
           ./build.sh -U -m evbarm -a earmv7hf -O ../obj -T ../tools tools
           ./build.sh -U -m evbarm -a earmv7hf -O ../obj -T ../tools kernel=GENERIC
 
@@ -29,5 +28,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: netbsd-kernel-earmv7hf
-          path: ../obj/sys/arch/evbarm/compile/GENERIC/netbsd
+          path: ${{ github.workspace }}/../obj/sys/arch/evbarm/compile/GENERIC/netbsd
 
