@@ -187,3 +187,14 @@ file	external/bsd/drm2/dist/drm/drm_vblank.c	drmkms
 file	external/bsd/drm2/drm/drm_vm.c	drmkms
 file	external/bsd/drm2/drm/drm_vma_manager.c	drmkms
 file	external/bsd/drm2/drm/drm_writeback.c	drmkms
+
+# Broadcom VC4 DRMKMS
+makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/dist/drivers/gpu/drm/vc4"
+
+file	external/bsd/drm2/dist/drivers/gpu/drm/vc4/vc4_drv.c		vc4drm
+file	external/bsd/drm2/dist/drivers/gpu/drm/vc4/vc4_kms.c		vc4drm
+file	external/bsd/drm2/dist/drivers/gpu/drm/vc4/vc4_crtc.c		vc4drm
+file	external/bsd/drm2/dist/drivers/gpu/drm/vc4/vc4_hdmi.c		vc4drm
+file	external/bsd/drm2/dist/drivers/gpu/drm/vc4/vc4_hvs.c		vc4drm
+file	external/bsd/drm2/dist/drivers/gpu/drm/vc4/vc4_plane.c		vc4drm
+file	external/bsd/drm2/dist/drivers/gpu/drm/vc4/vc4_v3d.c		vc4drm
