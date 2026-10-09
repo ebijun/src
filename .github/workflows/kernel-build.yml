@@ -21,8 +21,8 @@ jobs:
 
       - name: Build Tools and Kernel (earmv7hf)
         run: |
-          ./build.sh -U -m evbarm -a earmv7hf -O ./obj -T ./tools tools
-          ./build.sh -U -m evbarm -a earmv7hf -O ./obj -T ./tools kernel=GENERIC
+          ./build.sh -U -j4 -m evbarm -a earmv7hf -O ./obj -T ./tools tools
+          ./build.sh -U -j4 -m evbarm -a earmv7hf -O ./obj -T ./tools kernel=GENERIC
 
       - name: Upload Kernel Artifact
         uses: actions/upload-artifact@v4

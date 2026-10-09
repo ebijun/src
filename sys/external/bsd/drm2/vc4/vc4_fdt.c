@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2026 Jun Ebihara <jun@netbsd.org>
+ * Copyright (c) 2026 Jun Ebihara <jun@NetBSD.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -29,6 +29,7 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <sys/systm.h>
 
 #include <dev/fdt/fdtvar.h>
+#include <dev/ofw/openfirm.h>
 
 struct vc4_fdt_softc {
 	device_t		sc_dev;
@@ -53,21 +54,21 @@ static const struct device_compatible_entry compat_data[] = {
 static int
 vc4_fdt_match(device_t parent, cfdata_t match, void *aux)
 {
-	struct fdt_attach_args * const fa = aux;
+	struct fdt_attach_args * const faa = aux;
 
-	return fdtbus_match_compatible_data(fa, compat_data);
+	return of_compatible_match(faa->faa_phandle, compat_data);
 }
 
 static void
 vc4_fdt_attach(device_t parent, device_t self, void *aux)
 {
 	struct vc4_fdt_softc * const sc = device_private(self);
-	struct fdt_attach_args * const fa = aux;
-	const int phandle = fa->fa_phandle;
+	struct fdt_attach_args * const faa = aux;
+	const int phandle = faa->faa_phandle;
 
 	sc->sc_dev = self;
 	sc->sc_phandle = phandle;
-	sc->sc_bst = fa->fa_bst;
+	sc->sc_bst = faa->faa_bst;
 
 	aprint_naive("\n");
 	aprint_normal(": Broadcom VC4 DRMKMS\n");
