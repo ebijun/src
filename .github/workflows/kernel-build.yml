@@ -1,0 +1,32 @@
+name: NetBSD Kernel Cross-Compile CI
+
+on:
+  push:
+    branches: [ main, vc4-drmkms ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential zlib1g-dev libssl-dev git u-boot-tools
+
+      - name: Build Tools and Kernel (earmv7hf)
+        run: |
+          ./build.sh -m evbarm -a earmv7hf -O ../obj -T ../tools tools
+          ./build.sh -m evbarm -a earmv7hf -O ../obj -T ../tools kernel=GENERIC
+
+      - name: Upload Kernel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: netbsd-kernel-earmv7hf
+          path: ../obj/sys/arch/evbarm/compile/GENERIC/netbsd
+
