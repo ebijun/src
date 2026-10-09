@@ -565,6 +565,10 @@ pseudo-device	wsfont
 options 	FONT_BOLD8x16
 options 	FONT_BOLD16x32
 
+# Broadcom VC4 DRMKMS Graphics
+options     DRM2
+vc4drm*     at fdt? pass 5      # Broadcom VC4 DRMKMS
+
 # GPU
 #nouveau* 	at fdt?			# NVIDIA GPU
 

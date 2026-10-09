@@ -149,3 +149,9 @@ defflag opt_rpi.h                               RPI_HWCURSOR
 defflag	opt_bcm283x.h			SOC_BCM2835
 defflag	opt_bcm283x.h			SOC_BCM2836
 defflag opt_bcm283x.h			SOC_BCM2837: SOC_BCM2836
+
+# Broadcom VC4 DRMKMS Graphics
+device	vc4drm: drmkms
+attach	vc4drm at fdt with vc4_fdt
+file	external/bsd/drm2/vc4/vc4_fdt.c				vc4drm
+
