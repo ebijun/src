@@ -199,6 +199,7 @@ makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/dist/include/drm"
 makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/dist/include/uapi"
 makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/dist/drm/vc4"
 makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/common/include"
+makeoptions	vc4drm	CPPFLAGS+="-DCONFIG_DRM_VC4_HDMI_CEC"
 
 file	external/bsd/drm2/dist/drm/vc4/vc4_drv.c		vc4drm
 file	external/bsd/drm2/dist/drm/vc4/vc4_kms.c		vc4drm

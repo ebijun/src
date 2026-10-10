@@ -23,6 +23,10 @@
 #ifndef _DRM_DRM_FB_CMA_HELPER_H_
 #define _DRM_DRM_FB_CMA_HELPER_H_
 
+#include <linux/fb.h>
+#include <linux/io.h>
+#include <linux/mm.h>
+#include <linux/wait.h>
 #include <drm/drm_fb_helper.h>
 
 #endif /* _DRM_DRM_FB_CMA_HELPER_H_ */
