@@ -32,6 +32,8 @@
 #ifndef	_LINUX_CLK_H_
 #define	_LINUX_CLK_H_
 
+#include <sys/types.h>
+
 /* XXX Use FDT as a proxy for clk API until we have a clk flag.  */
 
 #ifdef _KERNEL_OPT
