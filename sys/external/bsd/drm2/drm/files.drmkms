@@ -192,6 +192,7 @@ file	external/bsd/drm2/drm/drm_writeback.c	drmkms
 makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/include"
 makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/include/drm"
 makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/include/linux"
+makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/include/sound"
 makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/dist/include"
 makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/dist/include/drm"
 makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/dist/include/uapi"
