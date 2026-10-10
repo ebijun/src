@@ -191,8 +191,10 @@ file	external/bsd/drm2/drm/drm_writeback.c	drmkms
 # Broadcom VC4 DRMKMS
 makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/include"
 makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/include/drm"
+makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/include/linux"
 makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/dist/include"
 makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/dist/include/drm"
+makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/dist/include/uapi"
 makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/dist/drm/vc4"
 makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/common/include"
 
