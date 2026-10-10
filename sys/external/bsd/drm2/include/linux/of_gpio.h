@@ -24,7 +24,7 @@
 #define _LINUX_OF_GPIO_H_
 
 #include <linux/gpio/consumer.h>
-#include <linux/of.h>
+#include <linux/of_device.h>
 
 #endif /* _LINUX_OF_GPIO_H_ */
 
