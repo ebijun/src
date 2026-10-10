@@ -23,7 +23,7 @@
 #ifndef _LINUX_OF_ADDRESS_H_
 #define _LINUX_OF_ADDRESS_H_
 
-#include <linux/of.h>
+#include <linux/of_device.h>
 #include <linux/platform_device.h>
 
 #endif /* _LINUX_OF_ADDRESS_H_ */
