@@ -6,12 +6,17 @@
 #ifndef _VC4_DRV_H_
 #define _VC4_DRV_H_
 
+#include <sys/types.h>
+
 #include <linux/compiler.h>
-#include <linux/io.h>
-#include <linux/mm.h>
+#include <linux/types.h>
 #include <linux/wait.h>
 #include <linux/semaphore.h>
 #include <linux/workqueue.h>
+#include <linux/mutex.h>
+#include <linux/list.h>
+
+#include <drm/drm_wait_netbsd.h>
 #include <drm/drm_device.h>
 #include <drm/drm_encoder.h>
 
