@@ -3,6 +3,26 @@
  * Copyright (C) 2015 Broadcom
  */
 
+#ifndef _VC4_DRV_H_
+#define _VC4_DRV_H_
+
+#include <linux/compiler.h>
+#include <linux/io.h>
+#include <linux/mm.h>
+#include <linux/wait.h>
+#include <linux/semaphore.h>
+#include <linux/workqueue.h>
+#include <drm/drm_device.h>
+#include <drm/drm_encoder.h>
+
+#ifndef __iomem
+#define __iomem
+#endif
+
+#ifndef vm_fault_t
+typedef int vm_fault_t;
+#endif
+
 #include <linux/delay.h>
 #include <linux/refcount.h>
 #include <linux/uaccess.h>
