@@ -16,6 +16,7 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/list.h>
+#include <linux/debugfs.h>
 
 #include <drm/drm_wait_netbsd.h>
 #include <drm/drm_device.h>
@@ -27,6 +28,15 @@
 
 #ifndef vm_fault_t
 typedef int vm_fault_t;
+#endif
+
+#ifndef CONFIG_DEBUG_FS
+struct debugfs_regset32 {
+	const struct debugfs_reg32 *regs;
+	int nregs;
+	void __iomem *base;
+	struct dev *dev;
+};
 #endif
 
 #include <linux/delay.h>
