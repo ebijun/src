@@ -29,6 +29,33 @@
  * ones that set the clock.
  */
 
+#include <sys/cdefs.h>
+__KERNEL_RCSID(0, "$NetBSD$");
+
+#include <sys/types.h>
+
+/* Linux-KPI 基本ヘッダーの先行インクルード */
+#include <linux/compiler.h>
+#include <linux/types.h>
+#include <linux/fb.h>
+#include <linux/semaphore.h>
+#include <linux/platform_device.h>
+#include <linux/mod_devicetable.h>
+#include <asm/io.h>
+#include <linux/io.h>
+
+#include <drm/drm_atomic.h>
+#include <drm/drm_atomic_helper.h>
+#include <drm/drm_crtc.h>
+#include <drm/drm_crtc_helper.h>
+#include <drm/drm_fb_cma_helper.h>
+#include <drm/drm_fourcc.h>
+#include <drm/drm_probe_helper.h>
+#include <drm/drm_vblank.h>
+
+#include "vc4_drv.h"
+#include "vc4_regs.h"
+
 #include <linux/clk.h>
 #include <linux/component.h>
 #include <linux/of_device.h>
@@ -391,9 +418,12 @@ static void vc4_crtc_mode_set_nofb(struct drm_crtc *crtc)
 	bool debug_dump_regs = false;
 
 	if (debug_dump_regs) {
-		struct drm_printer p = drm_info_printer(&vc4_crtc->pdev->dev);
-		dev_info(&vc4_crtc->pdev->dev, "CRTC %d regs before:\n",
+		struct drm_printer p = drm_info_printer(vc4_crtc->pdev->pd_dev);
+		dev_info(vc4_crtc->pdev->pd_dev, "CRTC %d regs before:\n",
 			 drm_crtc_index(crtc));
+
+
+
 		drm_print_regset32(&p, &vc4_crtc->regset);
 	}
 
@@ -435,8 +465,8 @@ static void vc4_crtc_mode_set_nofb(struct drm_crtc *crtc)
 	vc4_crtc_lut_load(crtc);
 
 	if (debug_dump_regs) {
-		struct drm_printer p = drm_info_printer(&vc4_crtc->pdev->dev);
-		dev_info(&vc4_crtc->pdev->dev, "CRTC %d regs after:\n",
+		struct drm_printer p = drm_info_printer(vc4_crtc->pdev->pd_dev);
+		dev_info(vc4_crtc->pdev->pd_dev, "CRTC %d regs after:\n",
 			 drm_crtc_index(crtc));
 		drm_print_regset32(&p, &vc4_crtc->regset);
 	}
