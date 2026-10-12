@@ -13,7 +13,7 @@ struct file;
 struct vm_fault;
 struct vm_area_struct;
 
-/* NetBSD Linux-KPI / DRM2 compatibility headers */
+/* NetBSD Linux-KPI / DRM2 compatibility headers in strict order */
 #include <linux/compiler.h>
 #include <linux/types.h>
 #include <linux/spinlock.h>
@@ -22,9 +22,10 @@ struct vm_area_struct;
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/list.h>
-#include <linux/io.h>
 #include <asm/io.h>
+#include <linux/io.h>
 #include <linux/platform_device.h>
+#include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/mod_devicetable.h>
 #include <linux/debugfs.h>
