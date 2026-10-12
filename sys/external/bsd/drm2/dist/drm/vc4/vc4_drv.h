@@ -2,7 +2,6 @@
 /*
  * Copyright (C) 2015 Broadcom
  */
-
 #ifndef _VC4_DRV_H_
 #define _VC4_DRV_H_
 
@@ -29,12 +28,21 @@ struct vm_area_struct;
 #include <linux/mod_devicetable.h>
 #include <linux/debugfs.h>
 #include <linux/mm.h>
+#include <linux/delay.h>
+#include <linux/refcount.h>
+#include <linux/uaccess.h>
 
 #include <drm/drm_wait_netbsd.h>
 #include <drm/drm_device.h>
 #include <drm/drm_encoder.h>
 #include <drm/drm_print.h>
 #include <drm/drm_gem_cma_helper.h>
+#include <drm/drm_atomic.h>
+#include <drm/drm_debugfs.h>
+#include <drm/drm_mm.h>
+#include <drm/drm_modeset_lock.h>
+
+#include "uapi/drm/vc4_drm.h"
 
 #ifndef wait_queue_head_t
 typedef drm_waitqueue_t wait_queue_head_t;
@@ -73,15 +81,10 @@ drm_print_regset32(struct drm_printer *p, struct debugfs_regset32 *regset)
 #include <linux/delay.h>
 #include <linux/refcount.h>
 #include <linux/uaccess.h>
-
 #include <drm/drm_atomic.h>
 #include <drm/drm_debugfs.h>
-#include <drm/drm_device.h>
-#include <drm/drm_encoder.h>
-#include <drm/drm_gem_cma_helper.h>
 #include <drm/drm_mm.h>
 #include <drm/drm_modeset_lock.h>
-
 #include "uapi/drm/vc4_drm.h"
 
 struct drm_device;
