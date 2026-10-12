@@ -34,6 +34,7 @@ __KERNEL_RCSID(0, "$NetBSD$");
 
 #include <sys/types.h>
 
+/* NetBSD Linux-KPI base headers */
 #include <linux/compiler.h>
 #include <linux/types.h>
 #include <linux/spinlock.h>
@@ -44,31 +45,19 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <linux/list.h>
 #include <linux/fb.h>
 #include <linux/platform_device.h>
-#include <linux/of.h>
 #include <linux/of_device.h>
+#include <linux/clk.h>
+#include <linux/component.h>
 #include <asm/io.h>
 #include <linux/io.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_atomic_uapi.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_fb_cma_helper.h>
 #include <drm/drm_fourcc.h>
-#include <drm/drm_probe_helper.h>
-#include <drm/drm_vblank.h>
-
-#include "vc4_drv.h"
-#include "vc4_regs.h"
-
-#include <linux/clk.h>
-#include <linux/component.h>
-#include <linux/of_device.h>
-
-#include <drm/drm_atomic.h>
-#include <drm/drm_atomic_helper.h>
-#include <drm/drm_atomic_uapi.h>
-#include <drm/drm_fb_cma_helper.h>
 #include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
