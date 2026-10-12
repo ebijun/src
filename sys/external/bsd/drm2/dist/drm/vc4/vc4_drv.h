@@ -6,8 +6,12 @@
 #ifndef _VC4_DRV_H_
 #define _VC4_DRV_H_
 
-#include <sys/types.h>
+/* 前方宣言 */
+struct file;
+struct vm_fault;
+struct vm_area_struct;
 
+/* NetBSD Linux-KPI / DRM2 互換基本ヘッダー */
 #include <linux/compiler.h>
 #include <linux/types.h>
 #include <linux/spinlock.h>
@@ -17,10 +21,15 @@
 #include <linux/workqueue.h>
 #include <linux/list.h>
 #include <linux/debugfs.h>
+#include <linux/mm.h>
 
 #include <drm/drm_wait_netbsd.h>
 #include <drm/drm_device.h>
 #include <drm/drm_encoder.h>
+
+#ifndef wait_queue_head_t
+typedef drm_waitqueue_t wait_queue_head_t;
+#endif
 
 #ifndef __iomem
 #define __iomem
