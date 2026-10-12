@@ -34,6 +34,7 @@ struct vm_area_struct;
 #include <drm/drm_device.h>
 #include <drm/drm_encoder.h>
 #include <drm/drm_print.h>
+#include <drm/drm_gem_cma_helper.h>
 
 #ifndef wait_queue_head_t
 typedef drm_waitqueue_t wait_queue_head_t;

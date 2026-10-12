@@ -31,6 +31,7 @@
 #include <linux/wait.h>
 
 #include <drm/drm_fb_helper.h>
+#include <drm/drm_gem_cma_helper.h>
 
 #endif /* _DRM_DRM_FB_CMA_HELPER_H_ */
 
