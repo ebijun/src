@@ -23,14 +23,17 @@ struct vm_area_struct;
 #include <linux/workqueue.h>
 #include <linux/list.h>
 #include <linux/io.h>
+#include <asm/io.h>
 #include <linux/platform_device.h>
 #include <linux/of_device.h>
+#include <linux/mod_devicetable.h>
 #include <linux/debugfs.h>
 #include <linux/mm.h>
 
 #include <drm/drm_wait_netbsd.h>
 #include <drm/drm_device.h>
 #include <drm/drm_encoder.h>
+#include <drm/drm_print.h>
 
 #ifndef wait_queue_head_t
 typedef drm_waitqueue_t wait_queue_head_t;
@@ -58,8 +61,6 @@ struct debugfs_regset32 {
 	struct dev *dev;
 };
 #endif
-
-#include <drm/drm_print.h>
 
 #ifndef drm_print_regset32
 static inline void
