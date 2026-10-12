@@ -59,6 +59,15 @@ struct debugfs_regset32 {
 };
 #endif
 
+#include <drm/drm_print.h>
+
+#ifndef drm_print_regset32
+static inline void
+drm_print_regset32(struct drm_printer *p, struct debugfs_regset32 *regset)
+{
+}
+#endif
+
 #include <linux/delay.h>
 #include <linux/refcount.h>
 #include <linux/uaccess.h>

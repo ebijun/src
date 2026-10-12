@@ -65,8 +65,9 @@ to_vc4_crtc_state(struct drm_crtc_state *crtc_state)
 	return (struct vc4_crtc_state *)crtc_state;
 }
 
-#define CRTC_WRITE(offset, val) writel(val, vc4_crtc->regs + (offset))
-#define CRTC_READ(offset) readl(vc4_crtc->regs + (offset))
+/* CRTC_READ and CRTC_WRITE macros with explicit uint8_t * pointer casting */
+#define CRTC_READ(offset) readl((uint8_t *)vc4_crtc->regs + (offset))
+#define CRTC_WRITE(offset, val) writel(val, (uint8_t *)vc4_crtc->regs + (offset))
 
 static const struct debugfs_reg32 crtc_regs[] = {
 	VC4_REG32(PV_CONTROL),
