@@ -25,7 +25,6 @@ struct vm_area_struct;
 #include <asm/io.h>
 #include <linux/io.h>
 #include <linux/platform_device.h>
-#include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/mod_devicetable.h>
 #include <linux/debugfs.h>
