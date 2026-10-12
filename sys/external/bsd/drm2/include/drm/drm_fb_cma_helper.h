@@ -25,6 +25,7 @@
 
 #include <sys/types.h>
 
+/* Include linux/fb.h before drm_fb_helper.h to provide struct fb_info */
 #include <linux/fb.h>
 #include <linux/io.h>
 #include <linux/mm.h>

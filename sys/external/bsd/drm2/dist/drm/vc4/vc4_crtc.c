@@ -46,6 +46,7 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <linux/fb.h>
 #include <linux/platform_device.h>
 #include <linux/of_device.h>
+#include <linux/mod_devicetable.h>
 #include <linux/clk.h>
 #include <linux/component.h>
 #include <asm/io.h>
