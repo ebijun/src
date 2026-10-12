@@ -6,12 +6,12 @@
 #ifndef _VC4_DRV_H_
 #define _VC4_DRV_H_
 
-/* 前方宣言 */
+#include <sys/types.h>
+
 struct file;
 struct vm_fault;
 struct vm_area_struct;
 
-/* NetBSD Linux-KPI / DRM2 互換基本ヘッダー */
 #include <linux/compiler.h>
 #include <linux/types.h>
 #include <linux/spinlock.h>
@@ -20,6 +20,9 @@ struct vm_area_struct;
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/list.h>
+#include <linux/io.h>
+#include <linux/of.h>
+#include <linux/of_device.h>
 #include <linux/debugfs.h>
 #include <linux/mm.h>
 
@@ -40,6 +43,11 @@ typedef int vm_fault_t;
 #endif
 
 #ifndef CONFIG_DEBUG_FS
+struct debugfs_reg32 {
+	const char *name;
+	unsigned long offset;
+};
+
 struct debugfs_regset32 {
 	const struct debugfs_reg32 *regs;
 	int nregs;
@@ -520,10 +528,10 @@ to_vc4_crtc(struct drm_crtc *crtc)
 	return (struct vc4_crtc *)crtc;
 }
 
-#define V3D_READ(offset) readl(vc4->v3d->regs + offset)
-#define V3D_WRITE(offset, val) writel(val, vc4->v3d->regs + offset)
-#define HVS_READ(offset) readl(vc4->hvs->regs + offset)
-#define HVS_WRITE(offset, val) writel(val, vc4->hvs->regs + offset)
+#define V3D_READ(offset) readl((uint8_t *)vc4->v3d->regs + (offset))
+#define V3D_WRITE(offset, val) writel(val, (uint8_t *)vc4->v3d->regs + (offset))
+#define HVS_READ(offset) readl((uint8_t *)vc4->hvs->regs + (offset))
+#define HVS_WRITE(offset, val) writel(val, (uint8_t *)vc4->hvs->regs + (offset))
 
 #define VC4_REG32(reg) { .name = #reg, .offset = reg }
 
