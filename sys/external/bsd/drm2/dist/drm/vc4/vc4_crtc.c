@@ -34,13 +34,18 @@ __KERNEL_RCSID(0, "$NetBSD$");
 
 #include <sys/types.h>
 
-/* Linux-KPI 基本ヘッダーの先行インクルード */
 #include <linux/compiler.h>
 #include <linux/types.h>
-#include <linux/fb.h>
+#include <linux/spinlock.h>
+#include <linux/mutex.h>
 #include <linux/semaphore.h>
+#include <linux/wait.h>
+#include <linux/workqueue.h>
+#include <linux/list.h>
+#include <linux/fb.h>
 #include <linux/platform_device.h>
-#include <linux/mod_devicetable.h>
+#include <linux/of.h>
+#include <linux/of_device.h>
 #include <asm/io.h>
 #include <linux/io.h>
 
