@@ -23,6 +23,7 @@ struct vm_area_struct;
 #include <linux/workqueue.h>
 #include <linux/list.h>
 #include <linux/io.h>
+#include <linux/platform_device.h>
 #include <linux/of_device.h>
 #include <linux/debugfs.h>
 #include <linux/mm.h>
