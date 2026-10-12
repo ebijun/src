@@ -8,10 +8,12 @@
 
 #include <sys/types.h>
 
+/* Forward declarations */
 struct file;
 struct vm_fault;
 struct vm_area_struct;
 
+/* NetBSD Linux-KPI / DRM2 compatibility headers */
 #include <linux/compiler.h>
 #include <linux/types.h>
 #include <linux/spinlock.h>
@@ -21,7 +23,6 @@ struct vm_area_struct;
 #include <linux/workqueue.h>
 #include <linux/list.h>
 #include <linux/io.h>
-#include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/debugfs.h>
 #include <linux/mm.h>
@@ -42,6 +43,7 @@ typedef drm_waitqueue_t wait_queue_head_t;
 typedef int vm_fault_t;
 #endif
 
+/* Stub definition for debugfs_regset32 in NetBSD DRM2 */
 #ifndef CONFIG_DEBUG_FS
 struct debugfs_reg32 {
 	const char *name;
@@ -528,6 +530,7 @@ to_vc4_crtc(struct drm_crtc *crtc)
 	return (struct vc4_crtc *)crtc;
 }
 
+/* MMIO read/write macros with explicit uint8_t * pointer casting */
 #define V3D_READ(offset) readl((uint8_t *)vc4->v3d->regs + (offset))
 #define V3D_WRITE(offset, val) writel(val, (uint8_t *)vc4->v3d->regs + (offset))
 #define HVS_READ(offset) readl((uint8_t *)vc4->hvs->regs + (offset))
