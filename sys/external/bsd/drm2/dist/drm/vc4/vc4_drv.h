@@ -13,7 +13,6 @@ struct file;
 struct vm_fault;
 struct vm_area_struct;
 struct platform_device;
-struct of_device_id;
 struct fb_info;
 struct fb_var_screeninfo;
 struct fb_cmap;
@@ -32,10 +31,10 @@ struct fb_image;
 #include <linux/list.h>
 #include <asm/io.h>
 #include <linux/io.h>
-#include <linux/fb.h>
 #include <linux/platform_device.h>
 #include <linux/of_device.h>
 #include <linux/mod_devicetable.h>
+#include <linux/fb.h>
 #include <linux/debugfs.h>
 #include <linux/mm.h>
 #include <linux/delay.h>
