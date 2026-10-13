@@ -21,7 +21,7 @@ struct fb_fillrect;
 struct fb_copyarea;
 struct fb_image;
 
-/* NetBSD Linux-KPI / DRM2 compatibility headers */
+/* NetBSD Linux-KPI / DRM2 compatibility headers in strict order */
 #include <linux/compiler.h>
 #include <linux/types.h>
 #include <linux/spinlock.h>
@@ -30,9 +30,9 @@ struct fb_image;
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/list.h>
-#include <linux/fb.h>
 #include <asm/io.h>
 #include <linux/io.h>
+#include <linux/fb.h>
 #include <linux/platform_device.h>
 #include <linux/of_device.h>
 #include <linux/mod_devicetable.h>
