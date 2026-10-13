@@ -25,9 +25,14 @@
 
 #include <sys/types.h>
 
-/* Linux-KPI and Framebuffer dependencies for NetBSD DRM2 */
-#include <linux/compiler.h>
-#include <linux/types.h>
+/* Forward declarations for framebuffer structures */
+struct fb_info;
+struct fb_var_screeninfo;
+struct fb_cmap;
+struct fb_fillrect;
+struct fb_copyarea;
+struct fb_image;
+
 #include <linux/fb.h>
 #include <linux/io.h>
 #include <linux/mm.h>
@@ -37,4 +42,3 @@
 #include <drm/drm_gem_cma_helper.h>
 
 #endif /* _DRM_DRM_FB_CMA_HELPER_H_ */
-

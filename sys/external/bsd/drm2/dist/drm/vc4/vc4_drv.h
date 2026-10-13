@@ -2,18 +2,26 @@
 /*
  * Copyright (C) 2015 Broadcom
  */
+
 #ifndef _VC4_DRV_H_
 #define _VC4_DRV_H_
 
-
 #include <sys/types.h>
 
-/* Forward declarations */
+/* Forward declarations for Linux-KPI / DRM types */
 struct file;
 struct vm_fault;
 struct vm_area_struct;
+struct platform_device;
+struct of_device_id;
+struct fb_info;
+struct fb_var_screeninfo;
+struct fb_cmap;
+struct fb_fillrect;
+struct fb_copyarea;
+struct fb_image;
 
-/* NetBSD Linux-KPI / DRM2 compatibility headers in strict order */
+/* NetBSD Linux-KPI / DRM2 compatibility headers */
 #include <linux/compiler.h>
 #include <linux/types.h>
 #include <linux/spinlock.h>
