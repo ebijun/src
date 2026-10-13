@@ -5,6 +5,7 @@
 #ifndef _VC4_DRV_H_
 #define _VC4_DRV_H_
 
+
 #include <sys/types.h>
 
 /* Forward declarations */
@@ -21,6 +22,7 @@ struct vm_area_struct;
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/list.h>
+#include <linux/fb.h>
 #include <asm/io.h>
 #include <linux/io.h>
 #include <linux/platform_device.h>
