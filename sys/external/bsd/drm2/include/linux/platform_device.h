@@ -39,7 +39,7 @@
 
 struct platform_device {
 	device_t	pd_dev;
-	struct device dev;
+	device_t	dev;
 	uint64_t	id;
 
 	bus_dma_tag_t	dmat;
@@ -76,6 +76,40 @@ to_platform_device(device_t self)
 /* Added Linux-KPI compatibility helpers for VC4 DRM driver */
 
 #include <linux/device.h>
+
+static inline void *
+platform_get_drvdata(const struct platform_device *pdev)
+{
+	return device_private(pdev->pd_dev);
+}
+
+static inline void
+platform_set_drvdata(struct platform_device *pdev, void *data)
+{
+	device_set_private(pdev->pd_dev, data);
+}
+
+static inline int
+platform_get_irq(struct platform_device *pdev, unsigned int num)
+{
+	return num;
+}
+
+static inline int
+devm_request_irq(device_t dev, int irq, void *handler, unsigned long flags,
+    const char *name, void *dev_id)
+{
+	return 0;
+}
+
+struct platform_driver {
+	int (*probe)(struct platform_device *);
+	int (*remove)(struct platform_device *);
+	struct {
+		const char *name;
+		const struct of_device_id *of_match_table;
+	} driver;
+};
 
 static inline void *
 platform_get_drvdata(const struct platform_device *pdev)
