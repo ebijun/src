@@ -72,4 +72,33 @@ to_platform_device(device_t self)
 	return device_private(self);
 }
 
+/* Added Linux-KPI compatibility helpers for VC4 DRM driver */
+
+#include <linux/device.h>
+
+static inline void *
+platform_get_drvdata(const struct platform_device *pdev)
+{
+	return device_private(pdev->pd_dev);
+}
+
+static inline void
+platform_set_drvdata(struct platform_device *pdev, void *data)
+{
+	device_set_private(pdev->pd_dev, data);
+}
+
+static inline int
+platform_get_irq(struct platform_device *pdev, unsigned int num)
+{
+	return num;
+}
+
+static inline int
+devm_request_irq(device_t dev, int irq, void *handler, unsigned long flags,
+    const char *name, void *dev_id)
+{
+	return 0;
+}
+
 #endif  /* _LINUX_PLATFORM_DEVICE_H_ */

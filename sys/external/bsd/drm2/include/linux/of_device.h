@@ -32,4 +32,12 @@
 #ifndef	_LINUX_OF_DEVICE_H_
 #define	_LINUX_OF_DEVICE_H_
 
+#include <linux/mod_devicetable.h>
+
+static inline const struct of_device_id *
+of_match_device(const struct of_device_id *matches, device_t dev)
+{
+	return matches;
+}
+
 #endif	/* _LINUX_OF_DEVICE_H_ */

@@ -96,4 +96,27 @@ dev_pm_set_driver_flags(struct device *dev, uint32_t flags)
 {
 }
 
+/* Added Linux-KPI compatibility helpers for VC4 DRM driver */
+
+#include <sys/device.h>
+#include <linux/slab.h>
+
+static inline void *
+dev_get_drvdata(const device_t dev)
+{
+	return device_private(dev);
+}
+
+static inline void
+dev_set_drvdata(device_t dev, void *data)
+{
+	device_set_private(dev, data);
+}
+
+static inline void *
+devm_kzalloc(device_t dev, size_t size, int flags)
+{
+	return kzalloc(size, flags);
+}
+
 #endif  /* _LINUX_DEVICE_H_ */
