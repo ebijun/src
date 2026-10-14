@@ -28,9 +28,9 @@
 #include <sys/mutex.h>
 
 struct semaphore {
-	kmutex_t	lock;
-	kcondvar_t	cv;
-	unsigned int	count;
+	kmutex_t lock;
+	kcondvar_t cv;
+	unsigned int count;
 };
 
 static inline void
@@ -49,6 +49,26 @@ down(struct semaphore *sem)
 		cv_wait(&sem->cv, &sem->lock);
 	sem->count--;
 	mutex_exit(&sem->lock);
+}
+
+static inline int
+down_interruptible(struct semaphore *sem)
+{
+	int error = 0;
+
+	mutex_enter(&sem->lock);
+	while (sem->count == 0) {
+		error = cv_wait_sig(&sem->cv, &sem->lock);
+		if (error) {
+			error = -error;
+			break;
+		}
+	}
+	if (error == 0)
+		sem->count--;
+	mutex_exit(&sem->lock);
+
+	return error;
 }
 
 static inline void

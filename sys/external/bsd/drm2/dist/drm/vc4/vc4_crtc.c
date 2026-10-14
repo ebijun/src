@@ -44,6 +44,8 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <linux/workqueue.h>
 #include <linux/list.h>
 #include <linux/fb.h>
+#include <linux/slab.h>
+#include <linux/device.h>
 #include <linux/platform_device.h>
 #include <linux/of_device.h>
 #include <linux/mod_devicetable.h>
@@ -57,7 +59,9 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <drm/drm_atomic_uapi.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_crtc_helper.h>
+#include <drm/drm_fb_helper.h>
 #include <drm/drm_fb_cma_helper.h>
+#include <drm/drm_gem_cma_helper.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
