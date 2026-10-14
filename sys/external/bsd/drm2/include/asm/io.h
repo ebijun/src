@@ -32,6 +32,17 @@
 #ifndef _ASM_IO_H_
 #define _ASM_IO_H_
 
+#include <sys/types.h>
+#include <sys/bus.h>
+
+#ifndef readl
+#define readl(addr)		(*(volatile uint32_t *)(addr))
+#endif
+
+#ifndef writel
+#define writel(val, addr)	(*(volatile uint32_t *)(addr) = (val))
+#endif
+
 #include <sys/cdefs.h>
 #include <sys/systm.h>
 
