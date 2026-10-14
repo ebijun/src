@@ -23,7 +23,14 @@
 #ifndef _LINUX_MOD_DEVICETABLE_H_
 #define _LINUX_MOD_DEVICETABLE_H_
 
-#include <linux/of_device.h>
+#include <sys/types.h>
+
+struct of_device_id {
+	char name[32];
+	char type[32];
+	char compatible[128];
+	const void *data;
+};
 
 #endif /* _LINUX_MOD_DEVICETABLE_H_ */
 
