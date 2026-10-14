@@ -98,7 +98,10 @@ dev_pm_set_driver_flags(struct device *dev, uint32_t flags)
 
 /* Added Linux-KPI compatibility helpers for VC4 DRM driver */
 
-#include <sys/device.h>
+struct device {
+	device_t bsdev;
+};
+
 #include <linux/slab.h>
 
 static inline void *
