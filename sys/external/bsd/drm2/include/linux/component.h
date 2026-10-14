@@ -32,4 +32,23 @@
 #ifndef _LINUX_COMPONENT_H_
 #define _LINUX_COMPONENT_H_
 
+#include <sys/types.h>
+#include <linux/device.h>
+
+struct component_ops {
+	int (*bind)(device_t dev, device_t master, void *data);
+	void (*unbind)(device_t dev, device_t master, void *data);
+};
+
+static inline int
+component_add(device_t dev, const struct component_ops *ops)
+{
+	return 0;
+}
+
+static inline void
+component_del(device_t dev, const struct component_ops *ops)
+{
+}
+
 #endif /*_LINUX_COMPONENT_H_*/
