@@ -38,7 +38,18 @@ struct fb_image;
 #include <linux/mm.h>
 #include <linux/wait.h>
 
+#include <drm/drm_framebuffer.h>
 #include <drm/drm_fb_helper.h>
 #include <drm/drm_gem_cma_helper.h>
 
+static inline struct drm_gem_cma_object *
+drm_fb_cma_get_gem_obj(struct drm_framebuffer *fb, unsigned int plane)
+{
+	if (!fb || plane >= 4)
+		return NULL;
+
+	return (struct drm_gem_cma_object *)fb->obj[plane];
+}
+
 #endif /* _DRM_DRM_FB_CMA_HELPER_H_ */
+
