@@ -39,6 +39,7 @@
 
 struct platform_device {
 	device_t	pd_dev;
+	struct device dev;
 	uint64_t	id;
 
 	bus_dma_tag_t	dmat;

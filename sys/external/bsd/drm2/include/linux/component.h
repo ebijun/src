@@ -41,13 +41,13 @@ struct component_ops {
 };
 
 static inline int
-component_add(device_t dev, const struct component_ops *ops)
+component_add(struct device *dev, const struct component_ops *ops)
 {
 	return 0;
 }
 
 static inline void
-component_del(device_t dev, const struct component_ops *ops)
+component_del(struct device *dev, const struct component_ops *ops)
 {
 }
 
