@@ -25,7 +25,7 @@
 
 #include <sys/types.h>
 
-/* Forward declarations for framebuffer structures */
+/* Forward declarations for Linux framebuffer structures */
 struct fb_info;
 struct fb_var_screeninfo;
 struct fb_cmap;
