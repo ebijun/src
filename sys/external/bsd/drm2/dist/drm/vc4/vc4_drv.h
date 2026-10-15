@@ -35,6 +35,7 @@ struct fb_image;
 #include <linux/of_device.h>
 #include <linux/mod_devicetable.h>
 #include <linux/fb.h>
+#include <linux/fs.h>
 #include <linux/debugfs.h>
 #include <linux/mm.h>
 #include <linux/delay.h>
@@ -45,6 +46,7 @@ struct fb_image;
 #include <drm/drm_device.h>
 #include <drm/drm_encoder.h>
 #include <drm/drm_print.h>
+#include <drm/drm_gem.h>
 #include <drm/drm_gem_cma_helper.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_debugfs.h>

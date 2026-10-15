@@ -78,7 +78,7 @@ to_platform_device(device_t self)
 
 /* Added Linux-KPI compatibility helpers for VC4 DRM driver */
 
-#include <linux/device.h>
+#include <linux/ioport.h>
 
 static inline int
 devm_request_irq(device_t dev, int irq, void *handler, unsigned long flags,
@@ -95,6 +95,19 @@ struct platform_driver {
 		const struct of_device_id *of_match_table;
 	} driver;
 };
+
+static inline struct resource *
+platform_get_resource(struct platform_device *pdev, unsigned int type,
+    unsigned int num)
+{
+	return NULL;
+}
+
+static inline void *
+devm_ioremap_resource(struct device *dev, const struct resource *res)
+{
+	return NULL;
+}
 
 static inline void *
 platform_get_drvdata(const struct platform_device *pdev)
