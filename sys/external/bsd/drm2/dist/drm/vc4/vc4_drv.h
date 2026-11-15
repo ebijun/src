@@ -13,12 +13,15 @@ struct file;
 struct vm_fault;
 struct vm_area_struct;
 struct platform_device;
+struct of_device_id;
 struct fb_info;
 struct fb_var_screeninfo;
 struct fb_cmap;
 struct fb_fillrect;
 struct fb_copyarea;
 struct fb_image;
+struct seq_file;
+struct drm_minor;
 
 /* NetBSD Linux-KPI / DRM2 compatibility headers in strict order */
 #include <linux/compiler.h>
@@ -29,21 +32,27 @@ struct fb_image;
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/list.h>
-#include <asm/io.h>
-#include <linux/io.h>
+#include <linux/fb.h>
+#include <linux/fs.h>
+#include <linux/mm.h>
+#include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/of_device.h>
 #include <linux/mod_devicetable.h>
-#include <linux/fb.h>
-#include <linux/fs.h>
+#include <asm/io.h>
+#include <linux/io.h>
 #include <linux/debugfs.h>
-#include <linux/mm.h>
 #include <linux/delay.h>
 #include <linux/refcount.h>
 #include <linux/uaccess.h>
 
-#include <drm/drm_wait_netbsd.h>
 #include <drm/drm_device.h>
+#include <drm/drm_drv.h>
+#include <drm/drm_file.h>
+#include <drm/drm_ioctl.h>
+#include <drm/drm_fourcc.h>
+#include <drm/vc4_drm.h>
+#include <drm/drm_wait_netbsd.h>
 #include <drm/drm_encoder.h>
 #include <drm/drm_print.h>
 #include <drm/drm_gem.h>

@@ -140,11 +140,13 @@ static void vc4_close(struct drm_device *dev, struct drm_file *file)
 	kfree(vc4file);
 }
 
+#ifndef __NetBSD__
 static const struct vm_operations_struct vc4_vm_ops = {
 	.fault = vc4_fault,
 	.open = drm_gem_vm_open,
 	.close = drm_gem_vm_close,
 };
+#endif
 
 static const struct file_operations vc4_drm_fops = {
 	.owner = THIS_MODULE,
@@ -199,7 +201,12 @@ static struct drm_driver vc4_drm_driver = {
 
 	.gem_create_object = vc4_create_object,
 	.gem_free_object_unlocked = vc4_free_object,
+
+#ifndef __NetBSD__
 	.gem_vm_ops = &vc4_vm_ops,
+#else
+	.gem_uvm_ops = &drm_gem_cma_uvm_ops,
+#endif
 
 	.prime_handle_to_fd = drm_gem_prime_handle_to_fd,
 	.prime_fd_to_handle = drm_gem_prime_fd_to_handle,
