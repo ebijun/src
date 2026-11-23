@@ -1,8 +1,8 @@
 # NetBSD BCM2711 HDMI DDC / VC4 DRM2対応 設計書
 
-- 文書バージョン: 0.6
+- 文書バージョン: 0.7
 - 作成日: 2026-11-22
-- 最終更新日: 2026-11-23
+- 最終更新日: 2026-11-24
 - 対象リポジトリ: [https://github.com/ebijun/src](https://github.com/ebijun/src)
 - 対象ブランチ: `vc4-drmkms`
 - 対象ハードウェア: Raspberry Pi 4 / BCM2711
@@ -1176,3 +1176,123 @@ Run #72で報告されたHD側エラーを直す際、HDMI core側も同じ `voi
 6. その後に残るClock、OF/DDC、HPD GPIO、Runtime PMを個別課題として扱う。
 
 Audio分離はASoC互換層を完成させる変更ではなく、Audioを使わずに映像/DDC移植を進めるための一時的なNetBSD opt-in制御である。HD register castもポインタ演算の型を明示する局所修正であり、実機でのHDMI動作確認の代わりにはならない。
+
+
+### 10.11 Run #75結果とVC4 DRM coreのNetBSD/Linux-KPI境界
+
+本節は、Audio分離およびHD register pointer arithmetic修正後に実行したGitHub Actions Run #75の結果を記録し、次の作業対象である `vc4_drv.c` とNetBSD DRM2/LinuxKPIの境界を整理する。
+
+対象:
+- ブランチ: `vc4-drmkms`
+- 対象ソースコミット: `3b51dee5b19c128c16052bcb1eadf049e53b068f`
+- GitHub Actions Run #75: [45262628653](https://github.com/ebijun/src/actions/runs/45262628653)
+- 主な対象: `sys/external/bsd/drm2/dist/drm/vc4/vc4_drv.c`
+- NetBSD側互換層: `sys/external/bsd/drm2/include/linux/` および `sys/external/bsd/drm2/dist/include/drm/`
+
+#### 10.11.1 Run #75で確認できたこと
+
+Run #75では、前段の変更により次のエラー群が解消した。
+
+- HDMI Audio / ASoCの型・関数不足はエラー一覧から消えた。Audioを初期移植の対象外にした分離方針は有効だった。
+- `HD_READ` / `HD_WRITE` の `void *` pointer arithmeticエラーは消えた。MMIO baseをbyte pointerへcastする局所修正は有効だった。
+
+一方、ビルドは成功していない。少なくとも `vc4_drv.o`、`vc4_hdmi.o`、`vc4_hvs.o` に未解決項目が残る。Run #75は「AudioとHD registerの問題を切り分けた段階」であり、VC4全体のNetBSD対応完了を意味しない。
+
+#### 10.11.2 `vc4_drm_fops` とNetBSD DRM device file operation
+
+Run #75の `vc4_drv.c` では、次のLinux用file operations定義がNetBSDビルドに露出している。
+
+```c
+static const struct file_operations vc4_drm_fops = {
+        .owner = THIS_MODULE,
+        .open = drm_open,
+        .release = drm_release,
+        .unlocked_ioctl = drm_ioctl,
+        .mmap = vc4_mmap,
+        .poll = drm_poll,
+        .read = drm_read,
+        .compat_ioctl = drm_compat_ioctl,
+        .llseek = noop_llseek,
+};
+```
+
+Run #75のエラーは `struct file_operations` が不完全、`owner` メンバーがない、`drm_open` / `drm_release` / `noop_llseek` が宣言されていない、というものだった。
+
+NetBSD側の `sys/external/bsd/drm2/include/linux/fs.h` は `sys/file.h` 等をincludeし、`file_inode()` を提供する最小互換ヘッダーであり、Linuxの `struct file_operations` を定義していない。これは単なるinclude不足ではない。LinuxのDRM character device file operationsをNetBSDのfileopsへそのまま移植することはできない。
+
+一方、NetBSD側の `sys/external/bsd/drm2/dist/include/drm/drm_drv.h` には `struct drm_driver` の `fops` メンバーに加え、`__NetBSD__` 専用の `ioctl_override` が存在する。また、同ファイルの `gem_prime_mmap` もNetBSD用に `off_t *`、`uvm_object **` 等を受け取る別シグネチャへ分岐している。したがってDRM coreにはすでにOS固有境界が一部設けられている。
+
+次の調査では、NetBSD DRM2のDRM device node生成・open/ioctl/mmap処理を追い、VC4が必要とする操作がDRM core側で提供される範囲を確定する。Linux用 `vc4_drm_fops` をNetBSD向けに模造したり、空のfileopsを追加したりしない。
+
+検討する方向:
+1. Linux専用の `vc4_drm_fops` 定義と `.fops = &vc4_drm_fops` 初期化を `#ifndef __NetBSD__` で隔離できるかを調べる。
+2. NetBSD DRM coreが `.fops` を参照せず、DRM2固有のdevice node/fileopsおよび `.ioctl_override` を使用する経路を確認する。
+3. VC4固有ioctlがNetBSD DRM coreのioctl dispatchへ正しく登録されるか確認する。
+4. `vc4_mmap`、GEM mmap、PRIME mmapの責務を分け、Linux VMA callbackをNetBSD UVM callbackへ誤って流用しない。
+
+`#ifndef __NetBSD__` による隔離は有力な候補だが、DRM coreの実際の登録経路を確認する前に確定修正として適用しない。
+
+#### 10.11.3 DRM component masterとNetBSD device attach
+
+`vc4_drv.c` は単独のplatform deviceだけで完結せず、VC4の複数ブロックをcomponentとして束ねるLinux component frameworkを前提としている。
+
+現行VC4 master側の処理:
+- `vc4_match_add_drivers()` が `component_drivers[]` の各platform driverを検索する。
+- `platform_find_device_by_driver()` と `component_match_add()` でmasterに参加するdeviceを登録する。
+- `component_master_add_with_match()` がmasterを登録する。
+- masterのbind callbackで `drm_dev_alloc()`、GEM初期化、`component_bind_all()`、KMS初期化、`drm_dev_register()`、fbdev初期化を行う。
+- unbind callbackではcomponent unbindとDRM/KMS/GEM資源の解放を行う。
+
+NetBSD側 `sys/external/bsd/drm2/include/linux/component.h` の現状は、`component_ops` と `component_add()` / `component_del()` の最小stubに限られる。master側の `component_master_ops`、`component_match`、`component_master_add_with_match()`、`component_bind_all()`、`component_unbind_all()`、`component_match_add()` は提供されていない。また `platform_find_device_by_driver()` も今回のNetBSD側ソースでは利用できない。
+
+これは関数宣言を足すだけの問題ではない。VC4ではHDMI/HVS/CRTC/V3D等の子deviceのattach完了を待ち、master bind時にそれぞれのbind callbackを実行し、失敗時には部分bindを逆順に解除する必要がある。no-op stubではDRM deviceが登録されても表示ハードウェアが初期化されず、動作上の誤りを隠す。
+
+次の調査で確定すること:
+- NetBSD FDT/platform attachで各VC4ブロックがどのdevice_t階層として生成されるか。
+- 各VC4 component driverのprobe/attachとbind/unbind相当処理の対応関係。
+- HDMI/HVS/CRTC等の依存関係とbind順序。
+- 子deviceが未attach、attach失敗、detachされる場合のmaster側の状態遷移。
+- NetBSDのdevice frameworkに合わせたmaster orchestrationをVC4側に実装するか、LinuxKPI component frameworkを意味のある形で実装するか。
+
+初期表示を優先する場合でも、VC4の全componentを無条件にbind済みとみなすstubは採用しない。まず表示に必須のHDMI/HVS/CRTC経路を特定し、V3D等のoptional componentを欠く構成での成立条件も確認する。
+
+#### 10.11.4 IRQ callbackとGEM PRIME mmapのOS別シグネチャ
+
+Run #75では、VC4 IRQ callbackの型がDRM coreの期待する型と一致しないエラーも発生した。
+
+VC4側ヘッダー `vc4_drv.h` の宣言はLinux形式の `irqreturn_t vc4_irq(int irq, void *arg)` である。一方、NetBSDの `sys/external/bsd/drm2/include/drm/drm_irq_netbsd.h` は `DRM_IRQ_ARGS` を `void *arg` と定義し、`struct drm_driver.irq_handler` は `irqreturn_t (*)(void *)` になる。NetBSD DRM2のIRQ登録モデルはLinuxのIRQ番号引数を含むhandler ABIとは異なる。
+
+対応方針:
+- Linux callback本体を安易に変更せず、NetBSD IRQ登録側が渡す引数とVC4 softc/DRM deviceの取得方法を確認する。
+- 必要であればNetBSD専用wrapperを用意し、正しいdevice contextを受け取って共通IRQ処理へ橋渡しする。
+- IRQ番号を使わないからといって引数を単純に捨てるのではなく、request_irq/free_irqとhandlerの引数契約を一体で確認する。
+
+同じく `gem_prime_mmap` は、Linux側の `struct vm_area_struct *` を受け取るcallbackと、NetBSD DRM2側の `off_t *`、`size_t`、`uvm_object **` 等を受け取るcallbackでシグネチャが異なる。NetBSDの `drm_drv.h` にはOS別メンバー宣言が既に存在するため、VC4側の `vc4_prime_mmap` を確認し、NetBSD用のUVM mapping処理を実装するか、既存のDRM CMA helperへ委譲できるかを判断する。関数ポインタのcastで警告を隠すことは禁止する。
+
+#### 10.11.5 `vc4_drv.c` の次の調査・実装順序
+
+次の作業は次の順で行う。各段階の調査結果と差分を分け、GitHub Actionsで確認する。
+
+1. **DRM device node境界の調査**: NetBSD DRM coreのdevice node登録、fileops、ioctl dispatch、mmap経路を読む。VC4のLinux `.fops` がNetBSDで不要か、NetBSD固有経路が何を要求するかを確定する。
+2. **component orchestrationの調査**: NetBSD FDT/platform device階層とVC4 component driverのattach/bind関係を一覧化する。必要なcomponentとoptional componentを分ける。
+3. **IRQ ABIの調査**: `drm_irq_netbsd.h`、DRM IRQ登録関数、VC4 IRQ handlerの呼び出し元・引数を照合し、NetBSD wrapperの設計を決める。
+4. **GEM/PRIME mmap ABIの調査**: `vc4_prime_mmap` とNetBSD UVM helperのシグネチャ・所有権・offset処理を照合する。
+5. **小さな修正を個別に適用**: 調査で境界が明らかになったものから一項目ずつ変更する。component frameworkは特に、stub追加でビルドだけ通すことを避ける。
+6. **CIで再確認**: 変更commitとActions Runを対応づけ、最初に `vc4_drv.o` のエラーがどう変化したか、その後のobjectで新たなエラーが出たかを記録する。
+
+#### 10.11.6 Run #75で残った他ファイルの課題
+
+`vc4_drv.c` の境界調査と並行して、次の局所問題も別差分として扱う。
+
+- `vc4_hdmi.c`: CEC無効化後にも `vc4_hdmi_connector_detect()` の切断経路に `cec_phys_addr_invalidate()` が無条件で残っている。CECを使わない構成では、この呼び出しも `#ifdef CONFIG_DRM_VC4_HDMI_CEC` で保護する。先行変更でCEC guardの重複と漏れが生じたため、同関数の両方の切断経路を確認してから修正する。
+- `vc4_hdmi.c` / `vc4_hvs.c`: `struct seq_file` はNetBSD LinuxKPIの `linux/seq_file.h` で前方宣言されているだけで、Linuxのseq_file実装は提供されていない。メンバーアクセスを行うdebugfs callbackは、単にheaderを追加しても解決しない。NetBSD debugfs実装との対応を確認し、初期移植で不要なdebugfs機能を適切に隔離できるか、実装が必要かを決める。
+- `vc4_hvs.c`: `hvs->regs + SCALER_DLIST_START` のような `void *` 加算が報告されている。レジスタoffsetの単位と `regs` の宣言を確認し、byte pointerへの明示castで修正する。HDMI側と同じく、アクセス幅やoffsetの意味を変えない。
+
+#### 10.11.7 作業原則
+
+- ビルドエラーを「ヘッダー不足」と即断せず、LinuxとNetBSDで型・callback・device lifecycleの契約が異なる場合はOS境界の問題として扱う。
+- NetBSD DRM2に存在する `__NetBSD__` 専用実装、`pdev->pd_dev`、`device_t`、FDT attach、UVM、bus_spaceの既存設計を優先して調べる。
+- 不足APIをno-op stubや関数ポインタcastで埋めてCIだけ通すことはしない。実際のbind/unbind、資源所有権、IRQ、mmapの意味を保つ。
+- 変更前に対象関数の全参照元とcleanup経路を確認し、変更後は `git diff --check` と対象差分をレビューする。
+- GitHub Actionsはコンパイル検証であり、実機のHDMI表示、EDID取得、割り込み動作を証明するものではない。
+- まず表示に必要な最小構成を明確にし、Audio/CEC/debugfs/V3D等のoptional機能とHDMI映像経路を分離して段階的に有効化する。
