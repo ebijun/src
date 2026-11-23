@@ -1,6 +1,6 @@
 # NetBSD BCM2711 HDMI DDC / VC4 DRM2対応 設計書
 
-- 文書バージョン: 0.5
+- 文書バージョン: 0.6
 - 作成日: 2026-11-22
 - 最終更新日: 2026-11-23
 - 対象リポジトリ: [https://github.com/ebijun/src](https://github.com/ebijun/src)
@@ -869,3 +869,120 @@ static int vc4_hdmi_audio_init(struct vc4_hdmi *hdmi)
 CECとAudioを別々に制御することで、CEC frameworkやASoCを移植する前でも、HDMI映像・DDC/EDID経路のコンパイルを先に進められる。
 
 なお、この節は調査と設計方針の記録であり、上記のソース変更はまだ実施していない。次段階ではまずCECのdefine削除とCEC依存箇所のガードを小さな変更として行い、ビルド結果を確認してからAudioガードを追加する。
+
+
+### 10.8 CECのみを無効化する変更計画（ソース編集前の調査）
+
+本節は、Audioを変更せずCECだけを無効化するための差分範囲を、現在の `vc4_hdmi.c` と `files.drmkms` に基づいて整理したもの。ここでは設計と変更対象を記録し、ソースコード自体はまだ変更しない。
+
+#### 10.8.1 ビルド設定
+
+対象ファイル:
+
+```
+sys/external/bsd/drm2/drm/files.drmkms
+```
+
+VC4設定内の次の1行を削除する。
+
+```make
+makeoptions	vc4drm	CPPFLAGS+="-DCONFIG_DRM_VC4_HDMI_CEC"
+```
+
+include pathの指定、VC4ソースファイルの `file ... vc4drm` 登録、Audio関連の設定は変更しない。これによりCEC用defineだけがコンパイルコマンドから外れる。カーネル構成を再生成・再ビルドした後、実際のコンパイルコマンドにdefineが残っていないことも確認する。
+
+#### 10.8.2 vc4_hdmi.cで追加保護が必要な箇所
+
+現状のソース調査では、CEC関連コードの一部は既に `#ifdef CONFIG_DRM_VC4_HDMI_CEC` で保護されているが、次の参照は無条件のままである。defineを削除する前に、これらを同じマクロで保護する必要がある。
+
+| 箇所 | 現状 | 変更方針 |
+| --- | --- | --- |
+| `#include "media/cec.h"` | 無条件include | CECマクロで囲む |
+| `CEC_CLOCK_FREQ` / `CEC_CLOCK_DIV` | CEC用定数 | CECマクロで囲むか、未使用なら削除 |
+| `struct vc4_hdmi` のCECメンバー4個 | 無条件メンバー | CECマクロで囲む |
+| `vc4_hdmi_connector_detect()` 内2か所 | `cec_phys_addr_invalidate()` が無条件 | 各呼び出しをCECマクロで囲む |
+| `vc4_hdmi_connector_get_modes()` 内 | `cec_s_phys_addr_from_edid()` が無条件 | 呼び出しをCECマクロで囲む |
+| `vc4_hdmi_unbind()` | `cec_unregister_adapter()` が無条件 | 呼び出しをCECマクロで囲む |
+
+一方、次の箇所は現状既にCECマクロで保護されているため、ガードを維持する。
+
+- CEC IRQ handler、CECメッセージ処理、CEC adapter ops（約1133行以降）
+- `vc4_hdmi_bind()` の `struct cec_connector_info` ローカル変数
+- CEC adapter生成、CECハードウェア設定、threaded IRQ登録、adapter登録（bind内）
+- `err_delete_cec_adap` および `err_destroy_conn` のエラーラベルと処理
+
+#### 10.8.3 追加するガードの形
+
+includeと定数は次のように保護する。
+
+```c
+#ifdef CONFIG_DRM_VC4_HDMI_CEC
+#include "media/cec.h"
+
+#define CEC_CLOCK_FREQ 40000
+#define CEC_CLOCK_DIV  (HSM_CLOCK_FREQ / CEC_CLOCK_FREQ)
+#endif
+```
+
+CECメンバーは共通HDMI状態構造体の中でまとめて保護する。
+
+```c
+struct vc4_hdmi {
+        /* common HDMI state */
+
+#ifdef CONFIG_DRM_VC4_HDMI_CEC
+        struct cec_adapter *cec_adap;
+        struct cec_msg cec_rx_msg;
+        bool cec_tx_ok;
+        bool cec_irq_was_rx;
+#endif
+};
+```
+
+connector detect内の2か所とEDID取得後の呼び出しも個別に保護する。
+
+```c
+#ifdef CONFIG_DRM_VC4_HDMI_CEC
+        cec_phys_addr_invalidate(vc4->hdmi->cec_adap);
+#endif
+```
+
+```c
+#ifdef CONFIG_DRM_VC4_HDMI_CEC
+        cec_s_phys_addr_from_edid(vc4->hdmi->cec_adap, edid);
+#endif
+```
+
+unbind時も同様にする。
+
+```c
+#ifdef CONFIG_DRM_VC4_HDMI_CEC
+        cec_unregister_adapter(hdmi->cec_adap);
+#endif
+        vc4_hdmi_connector_destroy(hdmi->connector);
+```
+
+これらはガード配置を示す抜粋であり、関数全体の置換コードではない。実際の編集では既存インデントと周辺エラー経路を維持する。
+
+#### 10.8.4 変更しない範囲
+
+今回の「CECだけを無効化」では、次の項目を変更しない。
+
+- Audio / ASoC関連include、構造体、callback、初期化関数と `vc4_hdmi_audio_init()` 呼び出し
+- HDMI DDC/I2C、EDID取得、HPD、clock、Runtime PM
+- HDMI本体のIRQや通常の表示経路
+- CECレジスタ定義そのもの（CECコードが無効化されてもレジスタヘッダー全体を削除しない）
+
+したがって、この変更でCEC関連のコンパイル依存は減るが、Audio/ASoCおよびOF/I2C/clock/GPIO/PM関連のエラーは残る見込みである。CEC無効化の成否とAudioの問題を混同しない。
+
+#### 10.8.5 適用後の確認手順
+
+1. `files.drmkms` からCEC defineだけを削除する。
+2. 上表の無条件CEC参照を `#ifdef CONFIG_DRM_VC4_HDMI_CEC` で保護する。
+3. `vc4_hdmi.c` の差分を確認し、Audio関連行に変更がないことを確認する。
+4. カーネル構成・ビルド環境に応じて必要な再生成を行い、古いオブジェクトを使わず `vc4_hdmi.o` を再コンパイルする。
+5. コンパイルコマンドに `-DCONFIG_DRM_VC4_HDMI_CEC` が残っていないことを確認する。
+6. CEC関連の不完全型・未定義関数エラーが消えたか確認する。
+7. 次に残るエラーを別機能（特にAudio/ASoC）として記録し、CEC変更と同じコミットに混在させない。
+
+この変更はCEC機能を無効にするもので、HDMI CEC端子の動作確認ではない。また、CECコードを条件コンパイルで除外しても、CEC以外のエラーが原因で `vc4_hdmi.o` 全体のビルドが失敗する可能性はある。
