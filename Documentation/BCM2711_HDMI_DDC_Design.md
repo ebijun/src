@@ -199,6 +199,86 @@ Linux実装ではデータレジスタ群を使用し、転送方向・START/STO
 
 実際の転送単位や分割条件については、Linuxドライバの転送処理を詳細に確認してからNetBSD側に反映する。
 
+
+### 3.7 Linux upstream転送処理の詳細確認（2026-11-23）
+
+Linux upstreamの `drivers/i2c/busses/i2c-brcmstb.c` を確認し、BCM2711 HDMI DDCに関係する初期化・転送処理を整理した。確認対象はGitHubのLinux `master` ブランチ上のファイル（確認時blob SHA: `52762249d46aafda0310772c688ae6cdf9a3b2f9`）。
+
+#### 3.7.1 データレジスタ幅と1回の転送量
+
+BCM2711では `data_regsz = sizeof(u32)`、すなわち1データレジスタあたり4バイトとして扱われる。データレジスタは8個なので、1回のBSCデータ転送で扱う上限は32バイトとなる。
+
+- 送信データ: `data_in[0..7]`（0x04～0x20）
+- 受信データ: `data_out[0..7]`（0x30～0x4c）
+- 1回の転送長: 最大32バイト
+- 32バイトを超えるメッセージ: Linux実装では32バイト以下の複数転送に分割
+
+`ctlhi_reg` の `BSC_CTLHI_REG_DATAREG_SIZE_MASK`（bit 6）をセットし、4バイト幅を選択する。NetBSD実装でもこの設定と、データレジスタへのバイト詰め・取り出し順序を再現する必要がある。
+
+#### 3.7.2 BSC制御ビット
+
+Linuxドライバで使用される主なビットは以下のとおり。
+
+| レジスタ | ビット／マスク | 意味 |
+| --- | ---: | --- |
+| `ctl_reg` | `0x03` | DTF転送方向フィールド |
+| `ctl_reg` | `0x30` | SCL選択 |
+| `ctl_reg` | `0x40` | 割り込み許可 |
+| `ctl_reg` | `0x80` | クロック分周 |
+| `iic_enable` | `0x40` | RESTART |
+| `iic_enable` | `0x20` | NOSTART |
+| `iic_enable` | `0x10` | NOSTOP |
+| `iic_enable` | `0x04` | NOACK制御 |
+| `iic_enable` | `0x02` | INTRP（転送完了状態） |
+| `iic_enable` | `0x01` | ENABLE（転送開始） |
+| `ctlhi_reg` | `0x40` | 4バイトデータレジスタ幅 |
+| `ctlhi_reg` | `0x02` | IGNORE_ACK |
+
+DTFはwriteで0、readで1を設定する。combined transfer用の値としてread/write方向の組み合わせも定義されているが、通常のメッセージ転送では各メッセージの方向に応じて設定する。
+
+#### 3.7.3 転送開始・完了・後処理
+
+Linux実装の1コマンドの概略は次のとおり。
+
+1. `iic_enable.INTRP` が立っていないことを確認し、前回転送中でないことを確認する（最大100ms）。
+2. 割り込みモードではcompletionを初期化する。ポーリングモードではINTRPビットを監視する。
+3. `ctl_reg.INT_EN` を有効にする。
+4. `iic_enable.ENABLE` をセットして転送を開始する。
+5. 完了を待つ。タイムアウトは100ms。
+6. 通常のread/writeコマンドでは `iic_enable.NOACK` を確認し、NACKならエラーとする。
+7. `cnt_reg` と `iic_enable` に0を書き、コマンド状態をクリアする。
+
+ポーリング時もLinux実装は `iic_enable.INTRP` を完了判定に使用する。NetBSD側では割り込みを初期段階で実装せず、同じ状態ビットをタイムアウト付きで監視する方針とする。NetBSDの遅延・待機APIは実装時に適切なものを選ぶ。
+
+#### 3.7.4 START / RESTART / STOPの扱い
+
+Linuxドライバは各 `i2c_msg` の前に `iic_enable` のSTART/STOP関連ビットを設定し、メッセージ間の条件を制御する。
+
+- 次のメッセージが通常のメッセージなら、現在のメッセージをNOSTOPで終え、次のメッセージでRESTARTを発行する。
+- 最終メッセージではRESTART/NOSTOPを解除し、転送終端でSTOPを発行する。
+- `I2C_M_NOSTART` が指定された場合は、アドレス再送とSTART条件を抑制する。
+- 1メッセージが32バイトを超える場合、途中チャンクではSTOPを発行せず、次チャンクをNOSTART | NOSTOPで継続する。
+
+したがって、LinuxKPI bridgeは複数の `i2c_msg` を個別の `iic_exec()` に単純分割してはならない。メッセージ列全体のSTART/RESTART/STOP意味を保てる転送経路が必要である。
+
+#### 3.7.5 アドレス処理
+
+7-bitアドレスの場合、Linux実装は `i2c_8bit_addr_from_msg()` でread/writeビットを含むアドレス値を生成し、`chip_address` に設定する。
+
+10-bitアドレスでは、上位アドレスバイトと下位アドレスバイトを別々に送信し、readの場合はRESTART後にreadビット付き上位バイトを再送する処理がある。EDID/DDCの初期用途は7-bitアドレス（0x50、必要に応じて0x30）だが、NetBSD側が対応するI2C機能の範囲はbridgeの実装時に明示する。
+
+#### 3.7.6 クロック設定
+
+Linuxドライバは対応する離散的な周波数テーブルを持つ。DTSの `clock-frequency = <97500>` に対しては、SCL選択値 `SPD_390K`（選択フィールド値1）とDIV_CLKを設定する。
+
+このため、NetBSD初期実装ではDTS値97500Hzを読み取り、対応する `ctl_reg` 設定を行う。任意の周波数を計算して設定する実装ではなく、Linuxと同様にサポートする値を明確に扱う。
+
+#### 3.7.7 エラーと未確定事項
+
+Linux実装では、busy待ち・転送完了待ちの両方に100msのタイムアウトがある。通常のread/writeでNACKを検出するとリモートI/Oエラーを返す。NetBSD側ではNetBSDのエラー値へ適切に対応付ける。
+
+Linuxコードの確認で転送チャンク上限32バイト、4バイトレジスタ幅、完了判定、NACK判定、メッセージ間条件の実装方針は確認できた。一方、実機での信号波形・タイミング、DDC拡張ブロックを含むEDID取得、実際の起動DTBでのノード有効状態は引き続き実機検証事項である。
+
 ---
 
 ## 4. 設計方針
