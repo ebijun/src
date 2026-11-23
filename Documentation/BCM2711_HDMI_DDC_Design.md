@@ -1,6 +1,6 @@
 # NetBSD BCM2711 HDMI DDC / VC4 DRM2対応 設計書
 
-- 文書バージョン: 0.2
+- 文書バージョン: 0.3
 - 作成日: 2026-11-22
 - 最終更新日: 2026-11-23
 - 対象リポジトリ: [https://github.com/ebijun/src](https://github.com/ebijun/src)
@@ -547,3 +547,129 @@ git push origin vc4-drmkms
 
 追従merge後にビルドが失敗した場合は、まずエラーがNetBSD `trunk` のAPI変更によるものか、既存のVC4移植コードに起因するものかを切り分ける。merge直後の状態とビルドログを保存し、修正を小さな単位で行う。原因が分からないまま追加の機能変更を重ねない。
 
+
+
+---
+
+## 10. GitHub Actionsによるクロスビルド確認
+
+### 10.1 ワークフロー構成
+
+作業ブランチにはGitHub Actionsのワークフローが設定されている。
+
+ファイル:
+
+```
+.github/workflows/kernel-build.yml
+```
+
+ワークフロー名:
+
+```
+NetBSD Kernel Cross-Compile CI
+```
+
+トリガーは次のとおり。
+
+- `vc4-drmkms` ブランチへのpush
+- `main` ブランチへのpush
+- `main` を対象とするpull request
+
+現在の作業ブランチ `vc4-drmkms` へのpushで自動実行される。
+
+実行環境とビルド対象:
+
+| 項目 | 設定 |
+| --- | --- |
+| 実行環境 | `ubuntu-latest` |
+| NetBSD machine | `evbarm` |
+| ABI | `earmv7hf` |
+| カーネル構成 | `GENERIC` |
+| 並列度 | `-j4` |
+| ビルド | build.shでtoolsおよびkernel=GENERIC |
+| 成果物 | `obj/sys/arch/evbarm/compile/GENERIC/netbsd` |
+
+成功時は `netbsd-kernel-earmv7hf` という名前でカーネルをArtifactとして保存する。
+
+このCIはクロスコンパイル確認であり、Raspberry Pi 4実機での起動・HDMI表示・DDC通信を保証するものではない。また、現行設定はearmv7hfのみであり、AArch64（aarch64/earmv8）ビルドは対象外である。
+
+### 10.2 2026-11-23時点の実行結果
+
+確認対象:
+
+- Run #67
+  - commit: `f53ee9b37f3f12e412d4c42bbfbcb56143e67eee`
+  - URL: https://github.com/ebijun/src/actions/runs/45153182432
+  - 結果: **failure**
+- Run #66
+  - commit: `4e8518db1f025a53aa031ef93dda837f9c6d3e7b`
+  - URL: https://github.com/ebijun/src/actions/runs/45152966915
+  - 結果: **failure**
+
+Run #67は当初確認時には実行中だったが、その後GitHub Actions上で完了し、failureとなった。Run #66とRun #67のログでは、いずれも `vc4_hdmi.o` のコンパイルでビルドが停止している。
+
+### 10.3 主なコンパイルエラー
+
+ログから確認できた主な不足・不整合は次のとおり。
+
+**CEC関連**
+
+- `struct cec_msg` が不完全型
+- `struct cec_adap_ops` の定義・メンバーが不足
+- `cec_received_msg()`、`cec_transmit_done()`、`cec_allocate_adapter()`、`cec_register_adapter()`、`cec_unregister_adapter()` 等の宣言がない
+- `CEC_TX_STATUS_OK`、`CEC_TX_STATUS_NACK` 等の定義がない
+
+**ASoC / HDMI audio関連**
+
+- `snd_soc_card_set_drvdata()`、`devm_snd_soc_register_card()` 等の宣言がない
+- ASoC component、DAI、PCM設定に関する構造体定義が不完全
+- 関連するstatic定義が未使用となる警告（`-Werror`でエラー扱い）
+
+**Device Tree / I2C関連**
+
+- `of_parse_phandle()`、`of_node_put()`、`of_find_i2c_adapter_by_node()` の宣言がない
+- Linux `struct device` に期待される `of_node` メンバーがNetBSD LinuxKPI側にない
+- `EPROBE_DEFER` が未定義
+- `put_device()` の宣言がない
+
+**Clock / GPIO / IRQ / PM関連**
+
+- `devm_clk_get()`、`of_get_named_gpio_flags()`、`devm_request_threaded_irq()` 等の宣言・互換実装が不足
+- `struct of_phandle_args` 相当のGPIO関連型が不完全
+- `pm_runtime_enable()` が未定義
+
+**ポインタ演算**
+
+- `vc4_hdmi.c` の先頭付近（97～100行）およびCEC処理付近で、`void *`に対する算術演算がエラーとなる
+- NetBSDのコンパイラ設定では `-Werror=pointer-arith` によりエラーになるため、適切な型付きポインタまたは整数アドレス型への変換が必要
+
+これらは単にヘッダーを追加すればすべて解決するとは限らない。NetBSD LinuxKPIにAPI自体が存在しないケース、構造体の互換定義が不足しているケース、Linux側の機能をNetBSDで無効化・代替する設計が必要なケースを分けて調査する。
+
+### 10.4 CIを使った開発手順
+
+今後は次のサイクルを基本とする。
+
+1. ローカルで変更を小さく実施する。
+2. ローカルで対象カーネルのビルドを行う。
+3. ビルドが通った変更をコミットして `vc4-drmkms` にpushする。
+4. GitHub Actionsの該当commitの実行結果を確認する。
+5. 失敗した場合は最初のコンパイルエラーを起点に原因を分類する。
+6. 修正後、再度ローカルビルドとActionsの両方で確認する。
+
+CIの失敗ログは、NetBSD側に不足しているLinuxKPI APIや型定義を発見するための継続的な調査資料として利用する。
+
+GitHub Actionsの結果を確認するときは、ブランチ全体の最新実行だけでなく、対象commit SHAに紐づくrunを確認する。これにより、別のpushによる実行結果との取り違えを防ぐ。
+
+### 10.5 現時点での評価と次の課題
+
+現行CIはNetBSD kernel cross-compileの自動確認手段として有効である。一方、現在はVC4 HDMIソースのCEC、ASoC、Device Tree、I2C、clock、GPIO、IRQ、PMなど複数のLinux API互換性が不足しており、`vc4_hdmi.o` で停止している。
+
+今後はエラーを機能領域ごとに整理し、次の順で扱う。
+
+1. VC4 HDMIの必須表示経路と、初期段階では不要なCEC/ASoC機能を切り分ける。
+2. NetBSD LinuxKPIに既存実装があるAPIは、その実装・ヘッダーを調査して不足を補う。
+3. Linux専用APIでNetBSDに対応する仕組みがないものは、単純なスタブ追加を避け、NetBSDのFDT、I2C、clock、GPIO、IRQ等の仕組みに置き換える。
+4. `void *`ポインタ演算は、対象のレジスタ領域・データ領域に応じた型を明示して修正する。
+5. 各修正後にローカルビルドとGitHub Actionsの結果を照合する。
+
+CIが成功しても、実機でのDDC/EDID取得およびHDMI表示確認は別途必要である。
