@@ -1046,3 +1046,133 @@ HDMI core側の `HDMI_READ/HDMI_WRITE` にも同種の問題がないか確認�
 | 6 | Runtime PM | 既存PM互換層と電源管理方針を確認 |
 
 Run #72は `vc4_hdmi.o` で停止しているため、他のVC4 objectやカーネルリンクの成否はこのRunから判断しない。次の独立変更はAudio分離とし、CEC無効化の差分とは分ける。各runはbranch最新状態だけでなく対象commit SHAと対応づけて記録する。CIコンパイル成功と実機のDDC/EDID・HDMI表示・Audio動作は別々に判定する。
+
+
+### 10.10 Audio / ASoC分離およびHD register型修正の実施計画
+
+本節はRun #72で残ったAudio/ASoCとHD register accessのコンパイル問題について、次のソース変更の境界・確認項目を定義する。ここでは設計方針を記録し、`vc4_hdmi.c` と `files.drmkms` の実変更はまだ行わない。変更はAudio分離とMMIO型修正の2件に分け、差分とCI結果を個別に確認できるようにする。
+
+#### 10.10.1 Audio分離の目的とビルド方針
+
+NetBSD側のVC4 HDMI初期移植では、まずHDMI映像・connector・DDC/EDID経路をコンパイル可能にする。Linux ASoC互換層が不足しているAudioは、CECと同様にNetBSD側のopt-inマクロ `CONFIG_DRM_VC4_HDMI_AUDIO` で独立して無効化する。
+
+- Audio無効が既定状態であり、`files.drmkms` では `-DCONFIG_DRM_VC4_HDMI_AUDIO` を定義しない。
+- CEC用 `CONFIG_DRM_VC4_HDMI_CEC` とAudio用マクロを混同しない。
+- Linux upstreamのKconfigやLinux本来の機能構成は変更しない。これはNetBSD移植ビルド用の制御である。
+- Audio機能を削除するのではなく、ASoC互換層の移植後に再有効化できる状態で保持する。
+- Audio無効時にもHDMI映像・DDC/EDIDに必要なコード、共通HDMI register access、connector処理はコンパイル対象に残す。
+
+#### 10.10.2 Audioガードの対象範囲
+
+対象ファイルは `sys/external/bsd/drm2/dist/drm/vc4/vc4_hdmi.c`。現行ソースではsoundヘッダーが無条件includeであり、`struct vc4_hdmi_audio` と `struct vc4_hdmi.audio` メンバーも無条件で定義されている。Audio callback/DAI/PCM/DMA定義は連続した領域にまとまっている。
+
+次の依存範囲をすべて同じ `#ifdef CONFIG_DRM_VC4_HDMI_AUDIO` で保護する。
+
+1. `<sound/dmaengine_pcm.h>`、`<sound/pcm_drm_eld.h>`、`<sound/pcm_params.h>`、`<sound/soc.h>` の4つのinclude。
+2. `struct vc4_hdmi_audio` 定義全体。
+3. `struct vc4_hdmi` 内の `struct vc4_hdmi_audio audio;` メンバー。
+4. Audio専用の `vc4_hdmi_set_audio_infoframe()` と、そのほかAudioだけから参照される関数・データ。
+5. `vc4_hdmi_audio_set_mai_clock()` から `vc4_hdmi_audio_init()` までのASoC component、DAI、PCM、DMA、callback、control/widget/route定義一式。
+6. `vc4_hdmi_bind()` 内の `vc4_hdmi_audio_init(hdmi)` 呼び出しと、その戻り値を受けるAudio初期化専用のエラー分岐。
+
+概念的な配置:
+
+```c
+#ifdef CONFIG_DRM_VC4_HDMI_AUDIO
+#include <sound/dmaengine_pcm.h>
+#include <sound/pcm_drm_eld.h>
+#include <sound/pcm_params.h>
+#include <sound/soc.h>
+#endif
+
+#ifdef CONFIG_DRM_VC4_HDMI_AUDIO
+struct vc4_hdmi_audio {
+        /* existing Audio/ASoC state */
+};
+#endif
+
+struct vc4_hdmi {
+        /* common HDMI state */
+#ifdef CONFIG_DRM_VC4_HDMI_AUDIO
+        struct vc4_hdmi_audio audio;
+#endif
+        /* remaining common HDMI state */
+};
+
+#ifdef CONFIG_DRM_VC4_HDMI_AUDIO
+/* Audio infoframe helper, ASoC callbacks, DAI/PCM/DMA data,
+ * controls/widgets/routes and vc4_hdmi_audio_init().
+ */
+#endif
+
+/* In vc4_hdmi_bind(): */
+#ifdef CONFIG_DRM_VC4_HDMI_AUDIO
+        ret = vc4_hdmi_audio_init(hdmi);
+        if (ret)
+                goto err_destroy_encoder;
+#endif
+```
+
+このコードはガード範囲の説明であり、そのまま貼り付ける完成パッチではない。実編集時には `vc4_hdmi_set_audio_infoframe()` の全参照元を確認し、Audio以外から呼ばれている場合は共通側に残すか、呼び出し側を適切にガードする。Audio専用static変数・配列・関数がガード外に残ると `-Werror=unused-*` が再発するため、参照関係を確認してまとめて保護する。
+
+bind関数のエラーラベルはCECの `err_delete_cec_adap` / `err_destroy_conn` と独立に扱う。Audio初期化呼び出しをガードしただけで、CEC側の既存ラベルやconnector/encoderのcleanup順序を変更しない。Audio初期化を無効にした場合、Audio登録失敗にしか使われないラベルや変数があれば、それらも依存関係に従って整理する。ただし共通の `err_destroy_encoder` など他機能が使用するラベルは残す。
+
+#### 10.10.3 Audio分離の確認項目
+
+- `files.drmkms` に `CONFIG_DRM_VC4_HDMI_AUDIO` のdefineを追加しない。
+- soundヘッダーとASoC型への参照がAudioガード外に残っていない。
+- `struct vc4_hdmi` のAudioメンバー参照がAudioガード外に残っていない。
+- Audio専用関数・配列・staticデータが無効ビルド時に未使用警告を発生させない。
+- `vc4_hdmi_audio_init()` が無効ビルドから呼ばれない。
+- CECガードとAudioガードが独立しており、CEC無効化の動作を変えない。
+- HDMI connector、EDID、DDC、HPD、映像モード設定、共通HDMI register accessをAudio分離のためにガードしない。
+
+#### 10.10.4 HD register accessの型問題
+
+Run #72で指摘されたHD register accessのマクロは、現行 `vc4_hdmi.c` の次の定義である。
+
+```c
+#define HD_READ(offset) readl(vc4->hdmi->hd_regs + offset)
+#define HD_WRITE(offset, val) writel(val, vc4->hdmi->hd_regs + offset)
+```
+
+`hd_regs` は `void __iomem *` として保持されており、NetBSDのビルド設定では `void *` のポインタ演算が `-Werror=pointer-arith` で拒否される。レジスタオフセットはバイト単位であるため、byte pointerへ明示的にcastしてから加算する。
+
+修正案:
+
+```c
+#define HD_READ(offset) \\
+        readl((char __iomem *)vc4->hdmi->hd_regs + (offset))
+#define HD_WRITE(offset, val) \\
+        writel((val), (char __iomem *)vc4->hdmi->hd_regs + (offset))
+```
+
+`char` pointerを使うことで追加の整数型ヘッダーに依存せず、オフセットがバイト単位であることを表現する。実際の適用前にLinuxKPIの `readl()` / `writel()` 宣言が `void __iomem *` 相当を受け取ること、NetBSD側で `__iomem` がどのように定義されるかを確認する。必要なら既存DRM2コードのMMIO accessorの書き方に合わせる。
+
+現行ファイルには同様の形をした `HDMI_READ/HDMI_WRITE` も存在する。
+
+```c
+#define HDMI_READ(offset) readl(vc4->hdmi->hdmicore_regs + offset)
+#define HDMI_WRITE(offset, val) writel(val, vc4->hdmi->hdmicore_regs + offset)
+```
+
+Run #72で報告されたHD側エラーを直す際、HDMI core側も同じ `void __iomem *` 加算になっていることを見落とさない。コンパイラが指摘している範囲を確認し、同じ型問題が発生する場合は同じbyte-pointer方針で修正する。ただし今回の変更差分では、実際にエラーとなったマクロを起点に必要最小限の変更とし、MMIO accessor全体の設計変更やレジスタ幅・順序の変更は行わない。
+
+#### 10.10.5 HD register修正の検証
+
+- `hd_regs` と `hdmicore_regs` の宣言型を確認する。
+- offsetがbyte単位であることを確認する。
+- `readl/writel` に渡るアドレスが元のMMIO base + 同一offsetとなり、アクセス幅やレジスタ値を変更しないことを確認する。
+- `-Werror=pointer-arith` が解消したことをActionsログで確認する。
+- Audio分離と同時に修正する場合でも、Git diffではAudioガードとHD register macro変更を別々にレビューできるようにする。
+
+#### 10.10.6 変更・CIの進め方
+
+1. まず `vc4_hdmi.c` のAudio依存範囲を再確認し、`CONFIG_DRM_VC4_HDMI_AUDIO` のガードを追加する。CEC関連行は変更しない。
+2. 差分でAudio依存だけがガードされ、映像/DDC/EDID経路が残っていることを確認する。
+3. HD register macroのbyte-pointer castを別の小さな差分として追加する。HDMI core側macroもコンパイルエラーの有無を確認する。
+4. `git diff --check` と対象ファイルの差分確認後にcommit/pushする。
+5. GitHub Actionsの対象commit SHAとRun番号を記録し、まず `vc4_hdmi.o` のAudio/ASoCおよびpointer-arithエラーが消えたか確認する。
+6. その後に残るClock、OF/DDC、HPD GPIO、Runtime PMを個別課題として扱う。
+
+Audio分離はASoC互換層を完成させる変更ではなく、Audioを使わずに映像/DDC移植を進めるための一時的なNetBSD opt-in制御である。HD register castもポインタ演算の型を明示する局所修正であり、実機でのHDMI動作確認の代わりにはならない。
