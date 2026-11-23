@@ -1,7 +1,8 @@
 # NetBSD BCM2711 HDMI DDC / VC4 DRM2対応 設計書
 
-- 文書バージョン: 0.1
+- 文書バージョン: 0.2
 - 作成日: 2026-11-22
+- 最終更新日: 2026-11-23
 - 対象リポジトリ: [https://github.com/ebijun/src](https://github.com/ebijun/src)
 - 対象ブランチ: `vc4-drmkms`
 - 対象ハードウェア: Raspberry Pi 4 / BCM2711
@@ -482,4 +483,67 @@ BCM2711 HDMI DDCは既存BCM2835 BSCとは別のハードウェアインター�
 - NetBSD LinuxKPI I2C: `sys/external/bsd/drm2/include/linux/i2c.h`
 - NetBSD VC4 HDMI: `sys/external/bsd/drm2/dist/drm/vc4/vc4_hdmi.c`
 
+## 9. NetBSD `-current`への追従方針
+
+VC4 DRM/KMS移植はNetBSD `-current`のカーネルAPI、LinuxKPI、DRM2、FDT、ARM Broadcom関連コードに依存する。そのため、長期間ベースコードから乖離しないよう、定期的に作業ブランチへ `trunk` の変更を取り込む。
+
+### 9.1 追従頻度
+
+基本方針は次のとおり。
+
+- 通常の開発中は週1回を目安に追従を検討する。
+- 大きな実装段階（DDC FDT attach、I2C転送、LinuxKPI bridge、VC4 HDMI接続など）が完了した時点でも追従する。
+- DRM2、LinuxKPI、FDT、bus_space、ARM Broadcom関連に大きな変更があった場合は、週次を待たずに内容を確認する。
+- 開発を長期間停止していた場合は、再開時にまず差分を確認する。
+
+これは機械的に毎週mergeするという意味ではない。変更内容を確認し、作業の区切りとビルド可能な状態を確保してから取り込む。
+
+### 9.2 追従前の確認
+
+作業ブランチに未コミット変更がないことを確認する。未コミット変更がある場合は、先に内容を整理してコミットするか、安全な方法で退避する。
+
+```sh
+git switch vc4-drmkms
+git status --short
+git fetch origin
+```
+
+取り込まれていない `trunk` のコミットと変更規模を確認する。
+
+```sh
+git log --oneline --decorate HEAD..origin/trunk
+git diff --stat HEAD...origin/trunk
+```
+
+特に次の領域に関係する変更を確認する。
+
+- `sys/external/bsd/drm2/`
+- `sys/dev/i2c/` および LinuxKPI I2C関連
+- `sys/dev/fdt/`
+- `sys/arch/arm/broadcom/`
+- カーネル構成・ビルドシステム関連
+
+### 9.3 取り込みと検証
+
+差分を確認したうえで、作業ブランチへmergeする。
+
+```sh
+git merge --no-ff origin/trunk
+```
+
+コンフリクトが発生した場合は、NetBSD本体側の変更を無条件に採用せず、VC4移植側の意図と照合して解決する。解決後は差分を確認し、対象カーネルをビルドする。
+
+ビルドが成功したら作業ブランチをpushする。
+
+```sh
+git status
+git log --oneline -5
+git push origin vc4-drmkms
+```
+
+共有済みの作業ブランチでは、履歴を書き換えるrebaseよりmergeを基本とする。追従mergeとVC4移植の機能変更は、原因を追跡しやすくするため別々のコミットにする。
+
+### 9.4 ビルド失敗時
+
+追従merge後にビルドが失敗した場合は、まずエラーがNetBSD `trunk` のAPI変更によるものか、既存のVC4移植コードに起因するものかを切り分ける。merge直後の状態とビルドログを保存し、修正を小さな単位で行う。原因が分からないまま追加の機能変更を重ねない。
 
