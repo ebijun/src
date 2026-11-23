@@ -1,6 +1,6 @@
 # NetBSD BCM2711 HDMI DDC / VC4 DRM2対応 設計書
 
-- 文書バージョン: 0.4
+- 文書バージョン: 0.5
 - 作成日: 2026-11-22
 - 最終更新日: 2026-11-23
 - 対象リポジトリ: [https://github.com/ebijun/src](https://github.com/ebijun/src)
@@ -697,7 +697,7 @@ CEC部分では、次のようなLinux CEC frameworkの型・関数が不足し�
 
 関数宣言だけを追加してもCEC framework自体の互換性は得られない。CECは初期のHDMI映像出力・DDC/EDID確認には必須ではないため、初期ビルドではCEC機能を無効化し、CEC framework移植を後段に分離する方針が適切である。
 
-ソースには `CONFIG_DRM_VC4_HDMI_CEC` による条件コンパイルが存在する。NetBSD側のどの設定・ヘッダー・ビルドフラグがこのマクロを定義しているかは、別途確認が必要である。
+ソースには `CONFIG_DRM_VC4_HDMI_CEC` による条件コンパイルが存在する。NetBSD側では `sys/external/bsd/drm2/drm/files.drmkms` のVC4設定にある `makeoptions vc4drm CPPFLAGS+="-DCONFIG_DRM_VC4_HDMI_CEC"` が定義元である（10.7節参照）。
 
 #### 10.6.3 HDMI Audio / ASoC
 
@@ -708,7 +708,7 @@ Audio部分ではLinux ASoCに属する以下の型・関数が不足してい�
 - `struct snd_pcm_hardware`
 - `snd_soc_card_set_drvdata()`、`devm_snd_soc_register_card()`、`devm_snd_soc_register_component()` 等
 
-これは単なるヘッダー不足ではなく、ASoCサブシステムの移植範囲に関係する。CECとは独立した機能であり、CECを無効化してもAudio部分は残る。現状の `vc4_hdmi.c` ではAudioコードをCECと同じ条件コンパイルだけで除外できないため、NetBSD側でAudioを分離する条件を別途設計する必要がある。初期の映像/DDC確認ではAudioを後段に回す。
+これは単なるヘッダー不足ではなく、ASoCサブシステムの移植範囲に関係する。CECとは独立した機能であり、CECを無効化してもAudio部分は残る。現状の `vc4_hdmi.c` ではAudioコードはCECとは独立して無条件にコンパイルされる。NetBSD側のAudio専用opt-inマクロを新設して分離する方針を10.7節に記録する。初期の映像/DDC確認ではAudioを後段に回す。
 
 #### 10.6.4 Device Tree / DDC / I2C
 
@@ -749,3 +749,123 @@ HPD取得部分では `enum of_gpio_flags`、`of_get_named_gpio_flags()`、`OF_G
 Phase 1では、CECを無効化する設定がどこで定義されているかを先に確認する。またAudioはCECとは別の条件で囲む必要がある。条件コンパイルの変更前に、NetBSD側のVC4 Makefile、Kconfig相当の設定、LinuxKPIのconfig headerおよびコンパイルフラグを調査する。
 
 各段階で最初のエラーから順に修正し、ローカルビルドとGitHub Actionsの両方で確認する。コンパイルが通ったことと、DDC/EDID・HDMI表示が実機で動作することは別々に判定する。
+
+
+### 10.7 CEC設定マクロとAudio条件コンパイルの調査
+
+2026-11-23時点の `vc4-drmkms` ブランチを調査し、CECマクロの定義元とAudioコードの条件コンパイル範囲を確認した。
+
+#### 10.7.1 CECマクロの定義元
+
+定義元はLinux Kconfigではなく、NetBSD側の次のファイルである。
+
+```
+sys/external/bsd/drm2/drm/files.drmkms
+```
+
+同ファイルの「Broadcom VC4 DRMKMS」節に、次の設定がある。
+
+```make
+makeoptions	vc4drm	CPPFLAGS+="-DCONFIG_DRM_VC4_HDMI_CEC"
+```
+
+VC4の各ソースファイルは同節で `vc4drm` 条件によりカーネルへ組み込まれる。このため、上記makeoptionsがVC4コンパイル時の `CONFIG_DRM_VC4_HDMI_CEC` を定義し、CECコードを有効化している。CECの有効化はカーネルconfigの `options` ではなく、`files.drmkms` のコンパイルフラグによる。
+
+調査した `sys/external/bsd/drm2/dist/drm/vc4/` には `Kconfig` と `Makefile` は存在しない。したがって、Linux側KconfigでCECを選択解除する方法ではなく、NetBSD側の `files.drmkms` からこのdefineを外すのが最小の設定変更となる。
+
+#### 10.7.2 CECを無効化する際のソース側注意点
+
+`vc4_hdmi.c` にはCEC関連の条件コンパイルが既に存在するが、CEC依存がすべて囲まれているわけではない。現状確認できた箇所は次のとおり。
+
+- `#include "media/cec.h"` が無条件。
+- `struct vc4_hdmi` 内の `struct cec_adapter *`、`struct cec_msg` およびCEC状態フィールドが無条件。
+- CEC IRQ handler、CEC adapter ops、bind時のadapter登録・IRQ登録・エラー処理は `CONFIG_DRM_VC4_HDMI_CEC` で条件コンパイルされている。
+- `vc4_hdmi_unbind()` 内の `cec_unregister_adapter()` は無条件。
+
+したがって、`files.drmkms` からdefineを削除するだけでは、CECヘッダーや型が不足している環境でコンパイルが通るとは限らない。CECを完全に無効化するには、CECヘッダー、構造体メンバー、unbind時の解除処理も同じ `#ifdef CONFIG_DRM_VC4_HDMI_CEC` で保護する必要がある。既存のCEC handler・bind処理のガードは維持する。
+
+#### 10.7.3 Audioコードの現状
+
+現行 `vc4_hdmi.c` ではAudio/ASoC関連が無条件にコンパイルされる。主な範囲は次のとおり。
+
+- ファイル先頭の `sound/dmaengine_pcm.h`、`sound/pcm_drm_eld.h`、`sound/pcm_params.h`、`sound/soc.h` のinclude。
+- `struct vc4_hdmi_audio` と `struct vc4_hdmi` 内の `audio` メンバー。
+- HDMI Audio infoframeを作る `vc4_hdmi_set_audio_infoframe()`。
+- DAI、PCM、ASoC component、controls、DAPM、DMA設定などのAudio callback群。
+- `vc4_hdmi_audio_init()`。
+- bind末尾の `vc4_hdmi_audio_init(hdmi)` 呼び出し。
+
+CECの条件マクロはAudioコードを保護しない。CECを無効化してもASoC型・関数のコンパイルエラーは残る。
+
+#### 10.7.4 Audioを分離する条件コンパイル案
+
+NetBSD側のVC4 HDMI Audio専用opt-inマクロとして `CONFIG_DRM_VC4_HDMI_AUDIO` を設ける案を推奨する。初期段階では `files.drmkms` にこのマクロを定義せず、ASoC互換層が整った段階で明示的に有効化する。
+
+条件コンパイルは以下の依存範囲を一体として扱う。
+
+1. 4つのsoundヘッダーinclude。
+2. `struct vc4_hdmi_audio` と `struct vc4_hdmi` の `audio` メンバー。
+3. `vc4_hdmi_set_audio_infoframe()`。
+4. Audio callback・ASoC component・DAI・PCM・DMA定義一式（`vc4_hdmi_audio_set_mai_clock()` から `vc4_hdmi_audio_init()` まで）。
+5. bind関数内の `vc4_hdmi_audio_init()` 呼び出しと、その戻り値によるエラー分岐。
+
+概念的なガード配置は次の形とする。
+
+```c
+#ifdef CONFIG_DRM_VC4_HDMI_AUDIO
+#include <sound/dmaengine_pcm.h>
+#include <sound/pcm_drm_eld.h>
+#include <sound/pcm_params.h>
+#include <sound/soc.h>
+#endif
+
+#ifdef CONFIG_DRM_VC4_HDMI_AUDIO
+struct vc4_hdmi_audio {
+        /* existing ASoC / PCM state */
+};
+#endif
+
+struct vc4_hdmi {
+        /* common HDMI state */
+#ifdef CONFIG_DRM_VC4_HDMI_AUDIO
+        struct vc4_hdmi_audio audio;
+#endif
+};
+
+#ifdef CONFIG_DRM_VC4_HDMI_AUDIO
+static void vc4_hdmi_set_audio_infoframe(struct drm_encoder *encoder)
+{
+        /* existing implementation */
+}
+
+/* All ASoC, PCM, DAI and DMA callbacks and definitions. */
+
+static int vc4_hdmi_audio_init(struct vc4_hdmi *hdmi)
+{
+        /* existing implementation */
+}
+#endif
+
+/* In vc4_hdmi_bind(): */
+#ifdef CONFIG_DRM_VC4_HDMI_AUDIO
+        ret = vc4_hdmi_audio_init(hdmi);
+        if (ret)
+                goto err_destroy_encoder;
+#endif
+```
+
+上記はガード範囲を示す設計例であり、そのまま適用する完成パッチではない。実際の編集では既存関数の開始・終了位置を確認し、Audio専用関数の未使用警告やAudio初期化のエラー経路も含めて整合させる。Linux upstreamのKconfig設定を変更するのではなく、NetBSD側でAudioをopt-inにするための移植用スイッチとして扱う。
+
+#### 10.7.5 推奨する最小変更順序
+
+| 順序 | 対象 | 変更 |
+| --- | --- | --- |
+| 1 | `sys/external/bsd/drm2/drm/files.drmkms` | `-DCONFIG_DRM_VC4_HDMI_CEC` を一旦削除 |
+| 2 | `vc4_hdmi.c` | CEC include、構造体メンバー、unbindの解除処理を既存CECマクロで保護 |
+| 3 | `vc4_hdmi.c` | Audio関連一式を `CONFIG_DRM_VC4_HDMI_AUDIO` で保護 |
+| 4 | `files.drmkms` | ASoC移植が完了するまでAudioマクロは定義しない |
+| 5 | ビルド | `vc4_hdmi.o` を再ビルドし、次の未解決機能を確認 |
+
+CECとAudioを別々に制御することで、CEC frameworkやASoCを移植する前でも、HDMI映像・DDC/EDID経路のコンパイルを先に進められる。
+
+なお、この節は調査と設計方針の記録であり、上記のソース変更はまだ実施していない。次段階ではまずCECのdefine削除とCEC依存箇所のガードを小さな変更として行い、ビルド結果を確認してからAudioガードを追加する。
