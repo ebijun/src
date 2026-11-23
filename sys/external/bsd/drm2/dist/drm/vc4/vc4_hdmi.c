@@ -46,13 +46,17 @@
 #include <sound/pcm_drm_eld.h>
 #include <sound/pcm_params.h>
 #include <sound/soc.h>
+#ifdef CONFIG_DRM_VC4_HDMI_CEC
 #include "media/cec.h"
+#endif
 #include "vc4_drv.h"
 #include "vc4_regs.h"
 
 #define HSM_CLOCK_FREQ 163682864
+#ifdef CONFIG_DRM_VC4_HDMI_CEC
 #define CEC_CLOCK_FREQ 40000
 #define CEC_CLOCK_DIV  (HSM_CLOCK_FREQ / CEC_CLOCK_FREQ)
+#endif
 
 /* HDMI audio information */
 struct vc4_hdmi_audio {
@@ -82,10 +86,12 @@ struct vc4_hdmi {
 	int hpd_gpio;
 	bool hpd_active_low;
 
+#ifdef CONFIG_DRM_VC4_HDMI_CEC
 	struct cec_adapter *cec_adap;
 	struct cec_msg cec_rx_msg;
 	bool cec_tx_ok;
 	bool cec_irq_was_rx;
+#endif
 
 	struct clk *pixel_clock;
 	struct clk *hsm_clock;
@@ -203,7 +209,11 @@ vc4_hdmi_connector_detect(struct drm_connector *connector, bool force)
 		if (gpio_get_value_cansleep(vc4->hdmi->hpd_gpio) ^
 		    vc4->hdmi->hpd_active_low)
 			return connector_status_connected;
-		cec_phys_addr_invalidate(vc4->hdmi->cec_adap);
+#ifdef CONFIG_DRM_VC4_HDMI_CEC
+	#ifdef CONFIG_DRM_VC4_HDMI_CEC
+	cec_phys_addr_invalidate(vc4->hdmi->cec_adap);
+#endif
+#endif
 		return connector_status_disconnected;
 	}
 
@@ -234,7 +244,9 @@ static int vc4_hdmi_connector_get_modes(struct drm_connector *connector)
 	struct edid *edid;
 
 	edid = drm_get_edid(connector, vc4->hdmi->ddc);
+#ifdef CONFIG_DRM_VC4_HDMI_CEC
 	cec_s_phys_addr_from_edid(vc4->hdmi->cec_adap, edid);
+#endif
 	if (!edid)
 		return -ENODEV;
 
@@ -1470,7 +1482,9 @@ static void vc4_hdmi_unbind(struct device *dev, struct device *master,
 	struct vc4_dev *vc4 = drm->dev_private;
 	struct vc4_hdmi *hdmi = vc4->hdmi;
 
+#ifdef CONFIG_DRM_VC4_HDMI_CEC
 	cec_unregister_adapter(hdmi->cec_adap);
+#endif
 	vc4_hdmi_connector_destroy(hdmi->connector);
 	vc4_hdmi_encoder_destroy(hdmi->encoder);
 
