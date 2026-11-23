@@ -1,6 +1,6 @@
 # NetBSD BCM2711 HDMI DDC / VC4 DRM2対応 設計書
 
-- 文書バージョン: 0.3
+- 文書バージョン: 0.4
 - 作成日: 2026-11-22
 - 最終更新日: 2026-11-23
 - 対象リポジトリ: [https://github.com/ebijun/src](https://github.com/ebijun/src)
@@ -673,3 +673,79 @@ GitHub Actionsの結果を確認するときは、ブランチ全体の最新実
 5. 各修正後にローカルビルドとGitHub Actionsの結果を照合する。
 
 CIが成功しても、実機でのDDC/EDID取得およびHDMI表示確認は別途必要である。
+
+
+### 10.6 `vc4_hdmi.c` コンパイルエラーの機能別切り分け
+
+Run #67のコンパイルログと作業ブランチ上の `vc4_hdmi.c` を照合し、エラーを機能単位に分類した。ここでの分類は原因と移植上の依存関係を整理したものであり、修正が適用済みであることや、各APIの実機動作を確認したことを意味しない。
+
+#### 10.6.1 レジスタアクセス
+
+対象は `HDMI_READ` / `HDMI_WRITE` および関連するレジスタアクセスマクロ。レジスタベースの型が `void *` のままバイトオフセット演算されると、NetBSDの `-Werror=pointer-arith` で失敗する。
+
+修正時は、レジスタ幅・アクセスAPIに合わせた型付きポインタ（例: `uint8_t *`）を使用する。HDMI core側だけでなく、HD側など同種のマクロも確認する。これは機能依存が少なく、最初に対処できる局所的な型問題である。
+
+#### 10.6.2 HDMI CEC
+
+CEC部分では、次のようなLinux CEC frameworkの型・関数が不足している。
+
+- `struct cec_msg`、`struct cec_adap_ops`
+- `cec_get_drvdata()`
+- `cec_allocate_adapter()`、`cec_register_adapter()`、`cec_unregister_adapter()`
+- `cec_transmit_done()`、`cec_received_msg()`
+- `CEC_CAP_*`、`CEC_TX_STATUS_*` 等の定数
+
+関数宣言だけを追加してもCEC framework自体の互換性は得られない。CECは初期のHDMI映像出力・DDC/EDID確認には必須ではないため、初期ビルドではCEC機能を無効化し、CEC framework移植を後段に分離する方針が適切である。
+
+ソースには `CONFIG_DRM_VC4_HDMI_CEC` による条件コンパイルが存在する。NetBSD側のどの設定・ヘッダー・ビルドフラグがこのマクロを定義しているかは、別途確認が必要である。
+
+#### 10.6.3 HDMI Audio / ASoC
+
+Audio部分ではLinux ASoCに属する以下の型・関数が不足している。
+
+- `struct snd_soc_card`、`struct snd_soc_dai_link`、`struct snd_soc_dai_link_component`
+- `struct snd_soc_component_driver`、`struct snd_soc_dai_ops`、`struct snd_soc_dai_driver`
+- `struct snd_pcm_hardware`
+- `snd_soc_card_set_drvdata()`、`devm_snd_soc_register_card()`、`devm_snd_soc_register_component()` 等
+
+これは単なるヘッダー不足ではなく、ASoCサブシステムの移植範囲に関係する。CECとは独立した機能であり、CECを無効化してもAudio部分は残る。現状の `vc4_hdmi.c` ではAudioコードをCECと同じ条件コンパイルだけで除外できないため、NetBSD側でAudioを分離する条件を別途設計する必要がある。初期の映像/DDC確認ではAudioを後段に回す。
+
+#### 10.6.4 Device Tree / DDC / I2C
+
+HDMI DDC adapter取得処理はLinuxのOF・I2C device管理を前提としている。
+
+- `of_parse_phandle()`、`of_node_put()`
+- `of_find_i2c_adapter_by_node()`
+- `put_device()`
+- `EPROBE_DEFER`
+- Linux `struct device` の `of_node` メンバー
+
+NetBSD LinuxKPIの `struct i2c_adapter.dev` はLinuxの `struct device` と同じではない。前方宣言や関数プロトタイプだけを追加しても、ノードとadapterの関連付け・寿命管理は解決しない。
+
+BCM2711 HDMI DDC専用のNetBSD I2C controllerを用意し、LinuxKPI `i2c_adapter` bridgeを介してVC4に接続する設計を基本とする。既存BCM2835 BSCにcompatibleを追加するだけの対応は行わない。
+
+#### 10.6.5 Clock / Runtime PM
+
+不足APIとして `devm_clk_get()` および `pm_runtime_enable()` が確認されている。ClockはHDMIハードウェア初期化に関係するため、NetBSD側の既存clock frameworkと接続する方法を調べる。Runtime PMは空のスタブで済ませず、NetBSDの電源管理との整合を確認する。初期段階で固定電源状態を利用できるかは、初期化・停止経路を確認して判断する。
+
+#### 10.6.6 HPD GPIO
+
+HPD取得部分では `enum of_gpio_flags`、`of_get_named_gpio_flags()`、`OF_GPIO_ACTIVE_LOW` 等が不足している。Linux OF GPIO APIをそのまま宣言するのではなく、NetBSD FDT GPIO APIおよびGPIO frameworkに置き換える。HPDは接続検出に関係するため、固定接続を仮定した試験で代替できるかは検出経路と実機条件を確認して判断する。
+
+#### 10.6.7 IRQ
+
+`devm_request_threaded_irq()` のエラーはCEC IRQ登録経路に属する。通常のHDMI表示経路で必要となるIRQと混同しない。初期段階でCECを無効化する場合は、CEC用threaded IRQ登録も同じ条件で除外する。NetBSDの通常IRQ登録とLinuxKPI threaded IRQ互換層は別の課題として扱う。
+
+#### 10.6.8 段階的な対応順序
+
+| 段階 | 対応内容 | 目的 |
+| --- | --- | --- |
+| Phase 1 | レジスタポインタ演算の修正。CECとAudioを独立してビルド対象から分離 | `vc4_hdmi.o` の不要な依存を減らし、基本コードのコンパイルを進める |
+| Phase 2 | Clock、FDT、HPD GPIO、Runtime PMのNetBSD側接続方針を確定 | HDMI初期化・接続検出に必要な基盤を整える |
+| Phase 3 | BCM2711 HDMI DDC専用I2C controllerとLinuxKPI adapter bridgeを実装 | VC4からDDC通信を利用可能にする |
+| Phase 4 | EDID取得、モード検出、HDMI表示を実機確認 | 基本映像経路を検証する |
+| Phase 5 | CEC frameworkおよびHDMI Audio / ASoCを個別に移植 | 追加機能を段階的に有効化する |
+
+Phase 1では、CECを無効化する設定がどこで定義されているかを先に確認する。またAudioはCECとは別の条件で囲む必要がある。条件コンパイルの変更前に、NetBSD側のVC4 Makefile、Kconfig相当の設定、LinuxKPIのconfig headerおよびコンパイルフラグを調査する。
+
+各段階で最初のエラーから順に修正し、ローカルビルドとGitHub Actionsの両方で確認する。コンパイルが通ったことと、DDC/EDID・HDMI表示が実機で動作することは別々に判定する。
