@@ -986,3 +986,63 @@ unbind時も同様にする。
 7. 次に残るエラーを別機能（特にAudio/ASoC）として記録し、CEC変更と同じコミットに混在させない。
 
 この変更はCEC機能を無効にするもので、HDMI CEC端子の動作確認ではない。また、CECコードを条件コンパイルで除外しても、CEC以外のエラーが原因で `vc4_hdmi.o` 全体のビルドが失敗する可能性はある。
+
+
+### 10.9 GitHub Actions Run #72 の失敗分析（2026-11-23）
+
+対象は Run #72、commit `5e6b1b11f04f3a25a40cc39377db5e5d45bc29cd`（CEC無効化）、job `build-kernel`、`earmv7hf / evbarm / GENERIC`。Checkoutと依存導入は成功し、`vc4_hdmi.o` のコンパイルで停止した。ログ上、CEC frameworkの型・関数に関するエラーは見当たらず、CECを無効化した目的に対しては前進した。ただしオブジェクト全体は以下の別機能の問題で失敗している。
+
+#### 10.9.1 Audio / ASoC
+
+ログでは `struct snd_soc_component_driver`、`snd_soc_dai_ops`、`snd_soc_dai_driver`、`snd_soc_dai_link`、`snd_soc_card`、`snd_dmaengine_pcm_config` が不完全、または必要なメンバーを持たない。さらに `snd_soc_card_set_drvdata()`、`devm_snd_soc_register_card()`、`devm_snd_soc_register_component()`、`devm_snd_dmaengine_pcm_register()`、`snd_soc_dai_init_dma_data()` 等が未宣言で、PCM rate/format/streamやDMA bus-width定数も不足している。Audio controls/widgets/routesが未使用となる警告も発生し、`-Werror` で停止する。
+
+これは単純なinclude不足ではなく、NetBSD DRM2 sound互換層にLinux ASoCの構造体定義・メンバー・関数群が不足していることを示す。前方宣言では構造体メンバー参照や実体サイズを解決できない。初期の映像/DDC移植からAudioを分離するため、10.7.4節の方針どおり `CONFIG_DRM_VC4_HDMI_AUDIO` をNetBSD側opt-inスイッチとして導入し、Audio用include、構造体メンバー、callback/DAI/PCM/DMA定義、bind時のAudio初期化とエラー経路を一括してガードする。Audio専用static変数もガード内に含め、unused警告を残さない。ASoC移植完了後に再度有効化する。
+
+#### 10.9.2 Clock
+
+`devm_clk_get()` が暗黙宣言となり、戻り値がintと扱われて `struct clk *` への変換警告が出ている。前方宣言だけでは解決しない。DRM2 LinuxKPIに既存の宣言・実装があるか調べ、なければNetBSD clock frameworkおよびFDT clock取得との接続を設計する。仮のプロトタイプだけを追加してリンクを通す対応は避ける。
+
+#### 10.9.3 OF / Device Tree / DDC I2C
+
+`of_parse_phandle()`、`of_node_put()`、`of_find_property()`、`of_get_address()`、`of_find_i2c_adapter_by_node()` が未宣言。`struct device` に `of_node` がなく、`EPROBE_DEFER` と `put_device()` も不足する。これはLinux OF/device modelとNetBSD LinuxKPIの構造差であり、宣言を足すだけではnodeの取得・参照寿命やI2C adapterとの関連付けを解決しない。NetBSD FDT nodeの取得方法、BCM2711 HDMI DDC専用I2C controller、LinuxKPI `i2c_adapter` bridgeを一体で設計する。`EPROBE_DEFER` も単なる定数追加ではなく、DDC controller未attach時のprobe/bind延期方針が必要。`put_device()` はNetBSD側オブジェクト寿命との対応を確認してから扱う。
+
+#### 10.9.4 HPD GPIO
+
+`enum of_gpio_flags` のサイズ不明、`of_get_named_gpio_flags()` 未宣言、`OF_GPIO_ACTIVE_LOW` 未定義、および `dev->of_node` 不在が報告された。`hpd_gpio_flags` のunusedはGPIO API不成立に伴う二次エラー。NetBSD FDT GPIO APIとGPIO controllerの取得方法に置き換える。
+
+#### 10.9.5 HD register access
+
+次のHD側マクロが `void *` に対してオフセット演算しており、`-Werror=pointer-arith` で失敗する。
+
+```c
+#define HD_READ(offset) readl(vc4->hdmi->hd_regs + offset)
+#define HD_WRITE(offset, val) writel(val, vc4->hdmi->hd_regs + offset)
+```
+
+レジスタ領域の宣言型とMMIO helperの期待型を確認した上で、バイトオフセットなら例えば次のように型を明示する。
+
+```c
+#define HD_READ(offset) \\
+        readl((uint8_t *)vc4->hdmi->hd_regs + (offset))
+#define HD_WRITE(offset, val) \\
+        writel((val), (uint8_t *)vc4->hdmi->hd_regs + (offset))
+```
+
+HDMI core側の `HDMI_READ/HDMI_WRITE` にも同種の問題がないか確認する。
+
+#### 10.9.6 Runtime PM
+
+`pm_runtime_enable()` が未宣言で、コンパイラは `pm_runtime_disable()` を候補として示す。LinuxKPI Runtime PM互換層にenable操作が存在するか、宣言だけ不足しているかを調べる。空のスタブは避け、bind/unbindの対称性とHDMI blockの電源・clock状態を保証する方法を確認する。
+
+#### 10.9.7 対応順序
+
+| 順序 | 領域 | 対応 |
+| --- | --- | --- |
+| 1 | Audio / ASoC | 専用opt-inマクロで全体を分離 |
+| 2 | HD register access | MMIO型を確認しvoid pointer演算を修正 |
+| 3 | Clock | 既存LinuxKPI実装とNetBSD clock接続を調査 |
+| 4 | OF / DDC I2C | NetBSD FDTとI2C bridgeへ置換 |
+| 5 | HPD GPIO | NetBSD FDT GPIO APIへ置換 |
+| 6 | Runtime PM | 既存PM互換層と電源管理方針を確認 |
+
+Run #72は `vc4_hdmi.o` で停止しているため、他のVC4 objectやカーネルリンクの成否はこのRunから判断しない。次の独立変更はAudio分離とし、CEC無効化の差分とは分ける。各runはbranch最新状態だけでなく対象commit SHAと対応づけて記録する。CIコンパイル成功と実機のDDC/EDID・HDMI表示・Audio動作は別々に判定する。
