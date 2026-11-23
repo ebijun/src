@@ -42,10 +42,12 @@
 #include <linux/of_platform.h>
 #include <linux/pm_runtime.h>
 #include <linux/rational.h>
+#ifdef CONFIG_DRM_VC4_HDMI_AUDIO
 #include <sound/dmaengine_pcm.h>
 #include <sound/pcm_drm_eld.h>
 #include <sound/pcm_params.h>
 #include <sound/soc.h>
+#endif
 #ifdef CONFIG_DRM_VC4_HDMI_CEC
 #include "media/cec.h"
 #endif
@@ -58,6 +60,7 @@
 #define CEC_CLOCK_DIV  (HSM_CLOCK_FREQ / CEC_CLOCK_FREQ)
 #endif
 
+#ifdef CONFIG_DRM_VC4_HDMI_AUDIO
 /* HDMI audio information */
 struct vc4_hdmi_audio {
 	struct snd_soc_card card;
@@ -70,6 +73,7 @@ struct vc4_hdmi_audio {
 	struct snd_dmaengine_dai_dma_data dma_data;
 	struct snd_pcm_substream *substream;
 };
+#endif
 
 /* General HDMI hardware state. */
 struct vc4_hdmi {
@@ -78,7 +82,9 @@ struct vc4_hdmi {
 	struct drm_encoder *encoder;
 	struct drm_connector *connector;
 
+#ifdef CONFIG_DRM_VC4_HDMI_AUDIO
 	struct vc4_hdmi_audio audio;
+#endif
 
 	struct i2c_adapter *ddc;
 	void __iomem *hdmicore_regs;
@@ -100,10 +106,10 @@ struct vc4_hdmi {
 	struct debugfs_regset32 hd_regset;
 };
 
-#define HDMI_READ(offset) readl(vc4->hdmi->hdmicore_regs + offset)
-#define HDMI_WRITE(offset, val) writel(val, vc4->hdmi->hdmicore_regs + offset)
-#define HD_READ(offset) readl(vc4->hdmi->hd_regs + offset)
-#define HD_WRITE(offset, val) writel(val, vc4->hdmi->hd_regs + offset)
+#define HDMI_READ(offset) readl((char *)vc4->hdmi->hdmicore_regs + (offset))
+#define HDMI_WRITE(offset, val) writel((val), (char *)vc4->hdmi->hdmicore_regs + (offset))
+#define HD_READ(offset) readl((char *)vc4->hdmi->hd_regs + (offset))
+#define HD_WRITE(offset, val) writel((val), (char *)vc4->hdmi->hd_regs + (offset))
 
 /* VC4 HDMI encoder KMS struct */
 struct vc4_hdmi_encoder {
@@ -434,6 +440,7 @@ static void vc4_hdmi_set_spd_infoframe(struct drm_encoder *encoder)
 	vc4_hdmi_write_infoframe(encoder, &frame);
 }
 
+#ifdef CONFIG_DRM_VC4_HDMI_AUDIO
 static void vc4_hdmi_set_audio_infoframe(struct drm_encoder *encoder)
 {
 	struct drm_device *drm = encoder->dev;
@@ -451,6 +458,7 @@ static void vc4_hdmi_set_audio_infoframe(struct drm_encoder *encoder)
 
 	vc4_hdmi_write_infoframe(encoder, &frame);
 }
+#endif
 
 static void vc4_hdmi_set_infoframes(struct drm_encoder *encoder)
 {
@@ -709,6 +717,7 @@ static const struct drm_encoder_helper_funcs vc4_hdmi_encoder_helper_funcs = {
 	.enable = vc4_hdmi_encoder_enable,
 };
 
+#ifdef CONFIG_DRM_VC4_HDMI_AUDIO
 /* HDMI audio codec callbacks */
 static void vc4_hdmi_audio_set_mai_clock(struct vc4_hdmi *hdmi)
 {
@@ -1141,6 +1150,7 @@ static int vc4_hdmi_audio_init(struct vc4_hdmi *hdmi)
 	return ret;
 
 }
+#endif /* CONFIG_DRM_VC4_HDMI_AUDIO */
 
 #ifdef CONFIG_DRM_VC4_HDMI_CEC
 static irqreturn_t vc4_cec_irq_handler_thread(int irq, void *priv)
@@ -1450,9 +1460,11 @@ static int vc4_hdmi_bind(struct device *dev, struct device *master, void *data)
 		goto err_delete_cec_adap;
 #endif
 
+#ifdef CONFIG_DRM_VC4_HDMI_AUDIO
 	ret = vc4_hdmi_audio_init(hdmi);
 	if (ret)
 		goto err_destroy_encoder;
+#endif
 
 	vc4_debugfs_add_file(drm, "hdmi_regs", vc4_hdmi_debugfs_regs, hdmi);
 
