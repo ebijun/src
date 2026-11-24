@@ -1766,3 +1766,157 @@ Run #79は成功ではない。job logでは `vc4_hdmi.o` の失敗として、�
 この結論は、Run #79の対象commitに対する `earmv7hf / evbarm / GENERIC` ビルドの実測結果である。異なるcommit、別のkernel config、別アーキテクチャの全ビルド条件まで自動的に保証するものではない。今後のCIで同じ条件を維持する場合は、各runの `vc4_hdmi.c` compile commandを確認する。
 
 現時点では、Audio/CECを有効化する変更も、無効化のための追加define変更も不要である。現行CIの実条件は既に両機能無効であり、次の修正対象は `vc4_hdmi.c` のOF/FDT・I2C・GPIO・Runtime PM依存とする。
+
+
+### 10.17 VC4 HDMIのOF/FDT依存とNetBSD実装の照合
+
+10.16節で確認したRun #79の失敗項目について、現行 `vc4-drmkms` ブランチのLinux-KPIヘッダー、NetBSD FDT/I2C/GPIO実装、および `vc4_hdmi.c` の呼び出し側を照合した。本節はGitHub上の現行ソースを対象とする。ビルド・実機動作の検証を行ったものではない。
+
+#### 10.17.1 Linux-KPI側のdeviceとNetBSDのFDT nodeの違い
+
+確認した定義:
+
+- `sys/external/bsd/drm2/include/linux/device.h`
+- `sys/external/bsd/drm2/include/linux/platform_device.h`
+- `sys/external/bsd/drm2/include/linux/of_device.h`
+- `sys/external/bsd/drm2/include/linux/of_platform.h`
+- `sys/external/bsd/drm2/include/linux/of_address.h`
+- `sys/dev/fdt/fdtvar.h`
+- `sys/dev/ofw/openfirm.h`
+
+現行Linux-KPIの `struct device` は次の最小構造であり、Linuxの `dev->of_node` は存在しない。
+
+```c
+struct device {
+        device_t bsdev;
+};
+```
+
+一方、NetBSDの `struct platform_device` は `pd_dev` とLinux-KPI用の `dev` を持つ。
+
+```c
+struct platform_device {
+        device_t        pd_dev;
+        struct device   dev;
+        /* ... */
+};
+```
+
+NetBSDではデバイスのFDT nodeはLinuxの `struct device_node *` として保持されるのではなく、device handleからOF node番号へ変換して扱う仕組みがある。
+
+```c
+devhandle_to_of(device_handle(dev))
+```
+
+この変換関数は `sys/dev/ofw/openfirm.h` で宣言されている。FDT側のAPIは主に `int` のnode/phandle値を受け取る。したがってLinuxの `dev->of_node` を単にメンバー追加して既存のLinux APIを実装するだけでは不十分であり、NetBSD device handleから得られるnode値との対応をLinux-KPI境界で明示する必要がある。
+
+#### 10.17.2 OF APIとNetBSD FDT APIの対応
+
+| VC4/Linux側のAPI | NetBSD側で確認したAPI・実装 | 差異・対応方針 |
+|---|---|---|
+| `dev->of_node` | `device_handle()`、`devhandle_to_of()`、platform deviceの `pd_dev` | Linuxのnode pointerは存在しない。device handleからnode番号を得る境界が必要 |
+| `of_parse_phandle(node, prop, index)` | `fdtbus_get_phandle(node, prop)`、必要に応じ `fdtbus_get_phandle_from_native()` | NetBSD APIは整数node値を扱う。Linuxのnode pointer/refcountモデルを持ち込まない |
+| `of_node_put(node)` | 対応するnode参照解放APIは今回確認したFDT API群には見当たらない | 整数node番号を保持する設計なら通常はput操作を必要としない。Linux互換関数を安易にpointer用no-opとして追加しない |
+| `of_find_property(node, name, len)` | `fdtbus_get_prop(node, name, &len)`、`of_hasprop(node, name)` | propertyの存在確認とデータ取得は分離して利用できる |
+| `of_get_address(node, index, ...)` | `fdtbus_get_reg(node, index, &addr, &size)` | NetBSD側はbus address/sizeを出力引数で返す。Linuxの `const __be32 *` を返すAPIとは型・変換が異なる |
+| `of_device_is_available(node)` | `fdtbus_status_okay(node)` | FDT nodeのstatus判定に対応する既存APIがある |
+| `of_device_is_compatible(node, ...)` | `of_compatible()`、`of_compatible_match()` 等 | compatible照合APIはNetBSD側に存在する |
+
+`sys/dev/fdt/fdtvar.h` には `fdtbus_get_phandle()`、`fdtbus_get_prop()`、`fdtbus_get_reg()`、`fdtbus_status_okay()` 等が宣言されている。`sys/dev/ofw/openfirm.h` には `devhandle_to_of()`、`of_getprop_uint32()`、`of_hasprop()` 等が宣言されている。
+
+現行の `sys/external/bsd/drm2/include/linux/of_device.h` は `of_match_device()` の簡易実装だけで、nodeアクセスAPIを提供していない。`linux/of.h` は今回確認したブランチ上のパスには存在しない。`of_address.h` と `of_platform.h` も現状はincludeを束ねる薄いヘッダーであり、OF API本体の実装ではない。
+
+#### 10.17.3 HDMI DDC I2C adapterの取得
+
+VC4側の `vc4_hdmi_bind()` は次の順序でDDC nodeを取得し、I2C adapterを探す。
+
+```c
+ddc_node = of_parse_phandle(dev->of_node, "ddc", 0);
+if (!ddc_node)
+        return -ENODEV;
+
+hdmi->ddc = of_find_i2c_adapter_by_node(ddc_node);
+of_node_put(ddc_node);
+if (!hdmi->ddc)
+        return -EPROBE_DEFER;
+```
+
+NetBSD側では次の実装が確認できた。
+
+- `sys/dev/fdt/fdt_i2c.h`: `fdtbus_i2c_get_tag(int)`、`fdtbus_i2c_acquire(int, const char *)`
+- `sys/dev/fdt/fdt_i2c.c`: I2C controllerを `i2c_tag_t` とFDT phandleの組で登録・検索する
+- controller登録時のnode取得: `devhandle_to_of(device_handle(dev))`
+- `fdtbus_i2c_acquire(node, "ddc")` はpropertyから参照先nodeを得て、登録済みcontrollerの `i2c_tag_t` を返す
+
+ただし、これはLinuxの `struct i2c_adapter *` を返す `of_find_i2c_adapter_by_node()` と同じAPIではない。Linux-KPIの `struct i2c_adapter` は `sys/external/bsd/drm2/include/linux/i2c.h` に定義され、`linux_i2c.c` はそのadapter経由の転送をNetBSD `i2c_tag_t` に橋渡しする。一方、今回確認した `fdtbus_i2c_get_tag()` / `fdtbus_i2c_acquire()` は `i2c_tag_t` を直接返し、Linux adapterの取得・参照寿命管理までは行わない。
+
+したがって、VC4から `fdtbus_i2c_acquire()` の戻り値を `struct i2c_adapter *` として扱うことはできない。必要なのは、FDT nodeに対応するNetBSD `i2c_tag_t` とLinux-KPI `struct i2c_adapter` を結び付ける明示的なbridge/registryである。また、現行VC4の `put_device(&hdmi->ddc->dev)` と同じ寿命管理をNetBSD側でどう表現するかも別途決める必要がある。
+
+#### 10.17.4 HDMI HPD GPIOの取得
+
+VC4側は `hpd-gpios` propertyの存在を調べ、Linux GPIO番号とactive-low flagを取得する。
+
+```c
+if (of_find_property(dev->of_node, "hpd-gpios", &value)) {
+        enum of_gpio_flags hpd_gpio_flags;
+
+        hdmi->hpd_gpio = of_get_named_gpio_flags(dev->of_node,
+            "hpd-gpios", 0, &hpd_gpio_flags);
+        if (hdmi->hpd_gpio < 0)
+                return hdmi->hpd_gpio;
+
+        hdmi->hpd_active_low =
+            hpd_gpio_flags & OF_GPIO_ACTIVE_LOW;
+}
+```
+
+その後のVC4共通コードは `hdmi->hpd_gpio` を整数GPIO番号として `gpio_get_value_cansleep()` に渡す。
+
+NetBSD側で確認したGPIO APIは次の通り。
+
+- `sys/dev/fdt/fdt_gpio.h`: `struct fdtbus_gpio_pin` とacquire/release/read/write API
+- `sys/dev/fdt/fdt_gpio.c`: FDT propertyのphandle/cellを解析し、GPIO controllerのcallbackを呼び出す
+- `fdtbus_gpio_acquire(phandle, prop, flags)`: opaqueな `struct fdtbus_gpio_pin *` を返す
+- `fdtbus_gpio_read()` / `fdtbus_gpio_read_raw()`: 論理値またはraw値を読み取る
+- `fdtbus_gpio_release()`: acquireしたpinを解放する
+
+NetBSDのGPIOは整数番号を返すLinux legacy GPIO APIとは異なり、pin objectを通じてcontrollerにアクセスする。従って `fdtbus_gpio_acquire()` の結果を `int hpd_gpio` に格納したり、`gpio_get_value_cansleep()` に渡したりすることはできない。active-lowの扱いもLinux `OF_GPIO_ACTIVE_LOW` とNetBSDのGPIO controller/pin APIの論理値・raw値の契約を確認してから決める必要がある。
+
+現行 `sys/external/bsd/drm2/include/linux/of_gpio.h` は `linux/gpio/consumer.h` と `linux/of_device.h` をincludeするだけで、`of_get_named_gpio_flags()`、`enum of_gpio_flags`、`OF_GPIO_ACTIVE_LOW` の定義を提供していない。さらに今回確認したパスには `linux/gpio/consumer.h` 自体も見当たらない。ヘッダーをincludeするだけでは解決しない。
+
+#### 10.17.5 VC4での呼び出し位置と影響範囲
+
+現行 `sys/external/bsd/drm2/dist/drm/vc4/vc4_hdmi.c` の主なOF/FDT呼び出しは次の通り。
+
+| 位置（確認時点） | 呼び出し | 条件・用途 |
+|---|---|---|
+| 1079 | `of_find_property(dev->of_node, "dmas", NULL)` | HDMI Audio初期化内。Audio macroが未定義のCIでは除外 |
+| 1092 | `of_get_address(dev->of_node, 1, ...)` | HDMI Audio初期化内。Audio macroが未定義のCIでは除外 |
+| 1360 | `of_parse_phandle(dev->of_node, "ddc", 0)` | HDMI bindの共通経路。Audio/CEC無効でも必要 |
+| 1366 | `of_find_i2c_adapter_by_node(ddc_node)` | HDMI bindの共通経路。Audio/CEC無効でも必要 |
+| 1367 | `of_node_put(ddc_node)` | HDMI bindの共通経路 |
+| 1393 | `of_find_property(dev->of_node, "hpd-gpios", ...)` | HDMI HPD GPIOの共通経路 |
+| 1396 | `of_get_named_gpio_flags(...)` | HDMI HPD GPIOの共通経路 |
+
+従って、CIでAudio/CECが無効であっても、DDC phandle、I2C adapter lookup、HPD GPIOのOF/FDT依存は残る。Audio内の `of_find_property("dmas")` と `of_get_address()` は現行CIでの最初の修正対象ではない。
+
+#### 10.17.6 修正設計の結論
+
+今回の照合から、必要な作業を次のように分ける。
+
+1. **device nodeの取得境界**: Linux `struct device.of_node` を前提とせず、NetBSD `device_t` / `platform_device.pd_dev` から `device_handle()` と `devhandle_to_of()` でnode番号を得る。どのdevice wrapperがその `device_t` を保持するかを明示してから実装する。
+2. **phandle/property helper**: `of_parse_phandle` 相当を整数node番号で表現するのか、Linux互換 `struct device_node` wrapperを作るのかを決める。現在のFDT APIとの整合性からは整数node番号を使う方が自然だが、VC4側の型変更範囲を見て決定する。
+3. **DDC I2C bridge**: `fdtbus_i2c_acquire()` の `i2c_tag_t` とLinux-KPI `struct i2c_adapter` の対応付けを実装する。戻り値型をキャストするだけの対応は禁止。参照取得・解放の契約も定義する。
+4. **HPD GPIO bridge**: Linux整数GPIO番号を無理に再現するより、VC4側のHPD保持型とread/release経路をNetBSD `struct fdtbus_gpio_pin *` に合わせる案を優先検討する。active-lowの論理値はNetBSD GPIO APIの契約に従って扱う。
+5. **Audio専用OF API**: Audioを有効化する段階で `dmas` propertyとbus address取得を改めて対応する。現行のAudio無効ビルドに対して先行実装しない。
+
+現時点で `linux/of.h` にLinux互換のnode構造体・関数群を一括追加する変更は行わない。NetBSDのFDT nodeは整数handle/offsetを中心に構成されており、Linuxのnode pointerと参照カウントをそのまま模倣すると、不要な寿命管理や誤った型変換を導入するおそれがある。
+
+#### 10.17.7 次の実装順序
+
+- 第1段階: `struct device` と `platform_device.pd_dev` の対応を確認し、VC4 bindからNetBSD FDT node番号を取得する単一の内部helperを決める。
+- 第2段階: `ddc` propertyの解決と、NetBSD `i2c_tag_t` からLinux-KPI adapterへのbridgeを設計する。
+- 第3段階: HPD GPIOを `fdtbus_gpio_pin` ベースに変更し、acquire/read/releaseとactive-lowを実装する。
+- 第4段階: Audioを有効化する段階でのみ `dmas` と `reg` の取得helperを実装する。
+
+本節は現行ソースの照合結果と設計判断であり、まだCソースの修正やカーネルビルドを実施したものではない。次のパッチでは、まず第1段階のnode番号取得境界を最小変更で実装し、コンパイル結果を確認してからI2C/GPIOへ進む。
