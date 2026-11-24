@@ -148,6 +148,7 @@ static const struct vm_operations_struct vc4_vm_ops = {
 };
 #endif
 
+#ifndef __NetBSD__
 static const struct file_operations vc4_drm_fops = {
 	.owner = THIS_MODULE,
 	.open = drm_open,
@@ -159,6 +160,7 @@ static const struct file_operations vc4_drm_fops = {
 	.compat_ioctl = drm_compat_ioctl,
 	.llseek = noop_llseek,
 };
+#endif /* !__NetBSD__ */
 
 static const struct drm_ioctl_desc vc4_drm_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(VC4_SUBMIT_CL, vc4_submit_cl_ioctl, DRM_RENDER_ALLOW),
@@ -221,7 +223,9 @@ static struct drm_driver vc4_drm_driver = {
 
 	.ioctls = vc4_drm_ioctls,
 	.num_ioctls = ARRAY_SIZE(vc4_drm_ioctls),
+#ifndef __NetBSD__
 	.fops = &vc4_drm_fops,
+#endif /* !__NetBSD__ */
 
 	.name = DRIVER_NAME,
 	.desc = DRIVER_DESC,
