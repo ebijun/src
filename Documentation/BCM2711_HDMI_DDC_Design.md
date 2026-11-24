@@ -1583,3 +1583,111 @@ Actions #79の `vc4_drv.o` ログでは、以前のLinux file operationsに関�
 6. 各変更後にGitHub Actionsを実行し、最初に残るエラーが解消したか確認する。
 
 次の着手点は `vc4_drv.c:192` のIRQ callback ABIとする。component framework全体の変更を同じパッチへ混在させない。
+
+
+### 10.15 VC4 HDMI Audio / CEC のNetBSDビルド設定実体確認
+
+本節では、2026-11-25時点の `vc4-drmkms` ブランチをGitHub上で確認し、`CONFIG_DRM_VC4_HDMI_AUDIO` と `CONFIG_DRM_VC4_HDMI_CEC` の実際の定義箇所を確定する。従来の調査メモにはCECのdefineが `files.drmkms` に存在するとの記録があるが、現在のブランチのファイル内容とは一致しないため、過去の状態と現状を区別する。
+
+#### 10.15.1 確認したファイルと状態
+
+確認対象:
+
+- `sys/external/bsd/drm2/drm/files.drmkms`
+- `sys/external/bsd/drm2/dist/drm/vc4/vc4_hdmi.c`
+- 本ドキュメント
+
+現行 `sys/external/bsd/drm2/drm/files.drmkms` の `# Broadcom VC4 DRMKMS` セクションでは、`vc4drm` 用のinclude pathを追加し、次のソースを `vc4drm` として登録している。
+
+```make
+# Broadcom VC4 DRMKMS
+makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/include"
+makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/include/drm"
+makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/include/linux"
+makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/include/sound"
+makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/include/media"
+makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/dist/include"
+makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/dist/include/drm"
+makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/dist/include/uapi"
+makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/drm2/dist/drm/vc4"
+makeoptions	vc4drm	CPPFLAGS+="-I$S/external/bsd/common/include"
+
+file	external/bsd/drm2/dist/drm/vc4/vc4_drv.c		vc4drm
+file	external/bsd/drm2/dist/drm/vc4/vc4_kms.c		vc4drm
+file	external/bsd/drm2/dist/drm/vc4/vc4_crtc.c		vc4drm
+file	external/bsd/drm2/dist/drm/vc4/vc4_hdmi.c		vc4drm
+file	external/bsd/drm2/dist/drm/vc4/vc4_hvs.c		vc4drm
+file	external/bsd/drm2/dist/drm/vc4/vc4_plane.c		vc4drm
+file	external/bsd/drm2/dist/drm/vc4/vc4_v3d.c		vc4drm
+```
+
+このセクションには、次の定義は存在しない。
+
+```make
+-DCONFIG_DRM_VC4_HDMI_AUDIO
+-DCONFIG_DRM_VC4_HDMI_CEC
+```
+
+従って、少なくともこの `files.drmkms` の `vc4drm` 用CPPFLAGS設定は、Audio/CECのどちらも明示的に有効化していない。sound/include pathが存在することは、Audio機能の有効化を意味しない。また、CECのdefineをこのファイルから削除したという過去の記録は、現行ファイルの状態を説明するものではない。
+
+#### 10.15.2 現行 `vc4_hdmi.c` の条件コンパイル
+
+現行 `sys/external/bsd/drm2/dist/drm/vc4/vc4_hdmi.c` では、次の条件コンパイルが確認できる。
+
+| 対象 | 条件 |
+|---|---|
+| Sound関連4ヘッダー | `CONFIG_DRM_VC4_HDMI_AUDIO` |
+| `struct vc4_hdmi_audio` | `CONFIG_DRM_VC4_HDMI_AUDIO` |
+| `struct vc4_hdmi` のaudioメンバー | `CONFIG_DRM_VC4_HDMI_AUDIO` |
+| Audio処理関数群 | `CONFIG_DRM_VC4_HDMI_AUDIO` |
+| `vc4_hdmi_audio_init()` 呼び出し | `CONFIG_DRM_VC4_HDMI_AUDIO` |
+| CECヘッダー | `CONFIG_DRM_VC4_HDMI_CEC` |
+| `struct vc4_hdmi` のCECメンバー | `CONFIG_DRM_VC4_HDMI_CEC` |
+| CEC処理・初期化・終了処理 | `CONFIG_DRM_VC4_HDMI_CEC` |
+
+ソース上の代表的な位置は、Audio includeが45行付近、Audio構造体が63行付近、Audio処理本体が720行から1153行付近、bind時のAudio初期化が1463行付近である。CECについても51行付近のinclude、95行付近の状態メンバー、1155行以降の処理本体などに条件コンパイルがある（行番号は確認時点のもの）。
+
+このため、現行のソースでは両マクロが未定義なら、それぞれの条件ブロックは通常のCプリプロセッサ動作によりコンパイル対象から除外される。現行 `vc4_hdmi.c` はAudio/CECの独立したガードを既に持っている。
+
+#### 10.15.3 ビルド設定について確定したこと・未確定のこと
+
+確定したこと:
+
+1. `sys/external/bsd/drm2/drm/files.drmkms` はVC4ソースの登録と `vc4drm` 用include pathを設定している。
+2. 同ファイルの現行VC4セクションにはAudio/CECいずれの `-D` defineもない。
+3. `vc4_hdmi.c` はAudioとCECを別々のマクロで条件コンパイルしている。
+4. したがって、このファイルの設定だけを根拠に「CECは有効」「Audioは無効」と判定することはできない。両方とも明示的な有効化は見当たらない。
+
+未確定のこと:
+
+- カーネル構成、生成されたmakefile、他のmakeoptions、コマンドライン等から同名マクロが追加定義されていないか。
+- GitHub Actionsが実際に実行したコンパイルコマンドに、どちらかのdefineが含まれていないか。
+- CIが参照したcommitと今回確認したブランチ先端が一致するか。
+
+従って「カーネル全体で未定義」と断言するには、Actionsログの実際のコンパイルコマンドまたは生成済みビルド設定を確認する必要がある。本節の結論は、GitHub上の現行 `files.drmkms` における明示的な定義の有無である。
+
+#### 10.15.4 過去の記録との整合
+
+10.8節には `files.drmkms` に `makeoptions vc4drm CPPFLAGS+="-DCONFIG_DRM_VC4_HDMI_CEC"` が存在するとの記載がある。この記述は、今回取得した現行ファイルには該当行がないため、過去の調査時点の状態を示す記録として扱う。現行設定の説明として引用してはならない。
+
+10.10節の「Audio defineを追加しない」という方針は現行ファイルと整合する。一方、Audio/CECの実際の有効・無効を確定するには、最終的にCIコンパイルコマンドを確認する必要がある。
+
+#### 10.15.5 次の確認手順
+
+作業端末では、対象ブランチをcheckoutしたうえで次を実行する。
+
+```sh
+git switch vc4-drmkms
+
+git grep -n 'CONFIG_DRM_VC4_HDMI_AUDIO'
+git grep -n 'CONFIG_DRM_VC4_HDMI_CEC'
+
+grep -n -A40 '^# Broadcom VC4 DRMKMS' \
+    sys/external/bsd/drm2/drm/files.drmkms
+
+git diff --check
+```
+
+GitHub Actionsでは、`vc4_hdmi.c` のコンパイルコマンドを確認し、`-DCONFIG_DRM_VC4_HDMI_AUDIO` と `-DCONFIG_DRM_VC4_HDMI_CEC` の有無を記録する。必要ならコンパイル時の `-dM -E` 相当のプリプロセッサマクロ一覧も確認する。
+
+現時点では、ビルド設定ファイルへの追加変更は行わない。Audio/CECのどちらも `files.drmkms` から有効化されていないことを確認できたため、まずActionsの実コンパイル条件を確定する。映像/DDC経路を維持したままAudio/CECをopt-inにする既存方針は維持する。
