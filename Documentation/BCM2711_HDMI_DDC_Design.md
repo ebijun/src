@@ -1,6 +1,6 @@
 # NetBSD BCM2711 HDMI DDC / VC4 DRM2対応 設計書
 
-- 文書バージョン: 0.8
+- 文書バージョン: 0.9
 - 作成日: 2026-11-22
 - 最終更新日: 2026-11-24
 - 対象リポジトリ: [https://github.com/ebijun/src](https://github.com/ebijun/src)
@@ -1446,3 +1446,71 @@ Run #75で `vc4_prime_mmap` と `drm_driver.gem_prime_mmap` の関数ポイン�
 6. その後にcomponent master orchestrationへ進む。
 
 この段階のゴールはVC4 DRMのNetBSD fileopsを実装することではなく、NetBSD DRM2が既に提供するcdevsw/fileops経路を正しく利用し、Linux専用 `.fops` ABIへの不要な依存を取り除くことである。
+
+
+### 10.13 `vc4_drv.c` Linux file operationsのNetBSD除外
+
+10.12の調査結果に基づき、VC4 driverのLinux専用file operationsをNetBSDビルド対象から除外した。
+
+対象:
+- `sys/external/bsd/drm2/dist/drm/vc4/vc4_drv.c`
+- commit: `2a2f7f02194853335450bf06ead53d56ebc98418`
+- commit message: `drm/vc4: exclude Linux file operations on NetBSD`
+
+#### 10.13.1 変更内容
+
+Linux `struct file_operations` に依存する `vc4_drm_fops` 定義を `__NetBSD__` で除外した。
+
+```c
+#ifndef __NetBSD__
+static const struct file_operations vc4_drm_fops = {
+        .owner = THIS_MODULE,
+        .open = drm_open,
+        .release = drm_release,
+        .unlocked_ioctl = drm_ioctl,
+        .mmap = vc4_mmap,
+        .poll = drm_poll,
+        .read = drm_read,
+        .compat_ioctl = drm_compat_ioctl,
+        .llseek = noop_llseek,
+};
+#endif /* !__NetBSD__ */
+```
+
+同時に `struct drm_driver vc4_drm_driver` の `.fops` 初期化も同じ条件で囲んだ。
+
+```c
+        .ioctls = vc4_drm_ioctls,
+        .num_ioctls = ARRAY_SIZE(vc4_drm_ioctls),
+#ifndef __NetBSD__
+        .fops = &vc4_drm_fops,
+#endif /* !__NetBSD__ */
+```
+
+`vc4_vm_ops` は既に `#ifndef __NetBSD__` で囲まれていたため変更していない。`.ioctls` / `.num_ioctls`、`.open = vc4_open`、`.postclose = vc4_close` も維持した。これらはNetBSD DRM cdevsw/fileopsから呼ばれるDRM driver callbackであり、Linux file_operationsの `.open` / `.release` と同一のものではない。
+
+#### 10.13.2 期待する効果と未確認事項
+
+この変更により、NetBSDコンパイル時に以下のLinux file operations型・関数を参照しなくなる。
+
+- `struct file_operations` および `.owner`
+- Linux DRM file operationの `drm_open` / `drm_release` / `drm_ioctl`
+- `drm_poll` / `drm_read` / `drm_compat_ioctl`
+- `noop_llseek`
+- Linux VMA mmap entryである `vc4_mmap`
+
+NetBSDでは共通 `drm_cdevsw` / `drm_fileops` がopen/ioctl/read/poll/close/mmapを処理するため、上記Linux fileopsをdriver側で登録しないことが今回の変更意図である。
+
+ただし、この変更はNetBSD GEM mmapを完成させるものではない。NetBSD `drm_fop_mmap()` は `drm_driver.mmap_object` を呼ぶため、VC4の `.mmap_object` は別途設計・実装が必要である。`gem_uvm_ops` や `gem_prime_mmap` の型・動作も今回変更していない。
+
+#### 10.13.3 CI確認
+
+この変更commitをpushすると `vc4-drmkms` branchのGitHub Actionsが自動実行される。現時点ではソース差分をGitHub branch上で確認した段階であり、Actionsの結果は未確認として扱う。
+
+次の確認項目:
+1. `vc4_drv.o` で `file_operations`、`owner`、`drm_open`、`drm_release`、`noop_llseek` のエラーが消えること。
+2. `vc4_mmap` 等のLinux専用static関数がNetBSDビルドでunused warning/errorにならないこと。
+3. `vc4_drm_driver` initializerで `.fops` に関するエラーが出ないこと。
+4. 新たに現れた最初のエラーを記録し、fileops問題とは別の課題として切り分けること。
+
+CI成功前に「vc4_drv.cがビルド可能になった」とは判断しない。
