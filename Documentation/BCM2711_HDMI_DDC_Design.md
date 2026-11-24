@@ -1514,3 +1514,72 @@ NetBSDでは共通 `drm_cdevsw` / `drm_fileops` がopen/ioctl/read/poll/close/mm
 4. 新たに現れた最初のエラーを記録し、fileops問題とは別の課題として切り分けること。
 
 CI成功前に「vc4_drv.cがビルド可能になった」とは判断しない。
+
+
+### 10.14 GitHub Actions #78/#79 によるVC4 file operations変更後の検証
+
+#### 10.14.1 確認対象
+
+2026-11-24にGitHub branch `vc4-drmkms` の状態を確認した。
+
+- Repository: `ebijun/src`
+- branch HEAD: `cd0f5173ab2728c0fe46e41528dd21edff86a1e2`
+- file operations変更commit: `2a2f7f02194853335450bf06ead53d56ebc98418`
+- 記録更新commit: `cd0f5173ab2728c0fe46e41528dd21edff86a1e2`
+- CI #78: run ID `45304017094`、failure
+- CI #79: run ID `45304333435`、failure
+- 対象job: `build-kernel` / `Build Tools and Kernel (earmv7hf)`
+
+参照:
+- [Actions #78](https://github.com/ebijun/src/actions/runs/45304017094)
+- [Actions #79](https://github.com/ebijun/src/actions/runs/45304333435)
+- [file operations変更commit](https://github.com/ebijun/src/commit/2a2f7f02194853335450bf06ead53d56ebc98418)
+
+#### 10.14.2 file operations変更の評価
+
+GitHub上の `sys/external/bsd/drm2/dist/drm/vc4/vc4_drv.c` を確認し、次の2箇所が `#ifndef __NetBSD__` で囲まれていることを確認した。
+
+1. Linux `struct file_operations vc4_drm_fops` の定義。
+2. `struct drm_driver vc4_drm_driver` の `.fops = &vc4_drm_fops` 初期化。
+
+Actions #79の `vc4_drv.o` ログでは、以前のLinux file operationsに関する `file_operations`、`.owner`、`drm_open`、`drm_release`、`noop_llseek`、`.fops` のエラーは確認できなかった。
+
+従って、Linux file operationsをNetBSDビルドから除外する変更はソースに反映され、当該エラー群を先へ進めたと評価する。ただし、これは `vc4_drv.o` のコンパイル成功を意味しない。
+
+#### 10.14.3 Actions #79で残った主なエラー
+
+ログから確認したエラーを機能別に整理する。
+
+| 対象 | エラー・問題 | 次の調査方針 |
+|---|---|---|
+| `vc4_drv.c:192` | `irq_handler` がNetBSD側の `irqreturn_t (*)(void *)` とLinux側の `vc4_irq(int, void *)` で不一致 | NetBSD DRM driver IRQ callbackの契約を確認し、適切なwrapperを設計 |
+| `vc4_drv.c:220` | `gem_prime_mmap` がNetBSD UVM ABIとLinux `vm_area_struct *` ABIで不一致 | NetBSD用標準GEM/PRIME mmap helperへの委譲可否を調査 |
+| `vc4_drv.c:244-256` | `component_match`、`component_match_add`、`platform_find_device_by_driver`、`put_device` 等が未定義または型不一致 | Linux component frameworkをそのまま移植せず、NetBSD側のcomponent対応状況と代替構成を調査 |
+| `vc4_drv.c:271` | `struct device` に `coherent_dma_mask` がない | NetBSD Linux-KPIのDMA mask APIと `pdev->pd_dev` の対応を確認 |
+| `vc4_drv.c:278-281` | OF node検索・参照関数が未定義 | NetBSD FDT APIとの接続、既存KPI実装を調査 |
+| `vc4_drv.c:291` | `mutex_init` の型・引数が不一致 | Linux mutex wrapperを使うべき箇所か、NetBSD mutex APIとの境界を確認 |
+| `vc4_drv.c:301,320,346-375` | component master bind/unbind APIと構造体が未実装 | VC4 component orchestrationのNetBSD設計を独立して行う |
+| `vc4_drv.c:396-418` | platform driver登録API、module alias、未使用register関数 | NetBSDのdriver attach/module構成に合わせて初期化経路を整理 |
+| `vc4_hdmi.c` | `seq_file`、GPIO、CEC、clock、OF、I2C adapter、runtime PM関連の未定義API・型不一致 | HDMIの各Linux-KPI依存を個別に分類。CEC無効化方針との整合も確認 |
+| `vc4_hvs.c` | `seq_file` の不完全型、`void *` pointer arithmetic | debugfs/seq_file互換とMMIO register型を調査 |
+
+このほか、`vc4_hdmi.c` では `EPROBE_DEFER`、`struct device.of_node`、`enum of_gpio_flags` 等もエラーとなった。これらは単純なヘッダー追加だけで解決するとは限らず、NetBSD側の構造体・APIの有無を先に確認する。
+
+#### 10.14.4 CI結果の解釈
+
+#78と#79はいずれもfailureであり、kernel artifact uploadはskipされた。#79の失敗箇所は `Build Tools and Kernel (earmv7hf)` である。
+
+#79のログは `vc4_drv.o` だけでなく `vc4_hdmi.o`、`vc4_hvs.o` にも到達して複数のコンパイルエラーを報告している。したがって、今回のfile operations隔離は部分的な前進だが、VC4全体のNetBSDビルドは未達である。
+
+#### 10.14.5 次の作業順序
+
+一度に多数の互換層を変更せず、次の順に小さく切り分ける。
+
+1. `vc4_drv.c` のIRQ callback ABIを確認する。
+2. `gem_prime_mmap` と `mmap_object` のNetBSD UVM経路を整理する。関数ポインタcastで回避しない。
+3. component master / platform driver orchestrationを、NetBSD DRM2の実装範囲と照合して設計する。
+4. `struct device` / DMA / OF / mutexのLinux-KPI境界を個別に確認する。
+5. `vc4_hdmi.c` と `vc4_hvs.c` のdebugfs、CEC、clock、GPIO、OF依存を別課題として扱う。
+6. 各変更後にGitHub Actionsを実行し、最初に残るエラーが解消したか確認する。
+
+次の着手点は `vc4_drv.c:192` のIRQ callback ABIとする。component framework全体の変更を同じパッチへ混在させない。
