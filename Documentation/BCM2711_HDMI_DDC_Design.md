@@ -2041,3 +2041,126 @@ Linuxの `-EPROBE_DEFER` を返すだけでNetBSD component frameworkが自動�
 - [ ] I2C adapter bridgeとHPD GPIO変換は別パッチで実装・検証する。
 
 このhelperはFDT node番号を得るための最小境界であり、Linux OF API全体の互換層ではない。実装後はまずコンパイルし、次に実機または診断ログで `pdev->pd_dev` のhandle種別とnode値を確認する。現段階ではドキュメント上の設計提案であり、ソースコードは未変更である。
+
+
+### 10.19 `platform_device_of_node()` 仕様書
+
+10.18節で設計したFDT node取得helperについて、実装者・呼び出し側が共有する仕様を定義する。本節をhelperのAPI契約とし、実装時に契約を変更する場合は本節も同時に更新する。
+
+#### 10.19.1 目的と適用範囲
+
+`platform_device_of_node()` は、NetBSD Linux-KPIの `struct platform_device` から、そのplatform deviceに対応するNetBSD OF/FDT node値を取得するための内部helperである。
+
+- 対象はNetBSDのplatform deviceに限定する。
+- Linuxの `struct device_node *` は生成・返却しない。
+- 返却値はNetBSD `devhandle_to_of()` が返す整数node値であり、NetBSDの `fdtbus_*` / `of_*` APIに渡す。
+- propertyの検索、phandleの解決、node参照カウント、I2C/GPIO資源の取得は行わない。
+- Linux-KPI全般に公開する汎用OF helperではない。
+
+#### 10.19.2 宣言・配置
+
+実装ファイル:
+
+`sys/external/bsd/drm2/include/linux/platform_device.h`
+
+関数宣言:
+
+```c
+static inline int platform_device_of_node(
+    const struct platform_device *pdev);
+```
+
+ヘッダーは、少なくとも以下の宣言が可視となるようにする。
+
+```c
+#include <sys/device.h>
+#include <dev/ofw/openfirm.h>
+```
+
+既存のinclude順序や重複include guardに従い、同じヘッダーを重複して追加しない。実装本体は10.18.2節の提案コードを基準とする。
+
+#### 10.19.3 入力契約
+
+| 項目 | 仕様 |
+|---|---|
+| 引数 | `const struct platform_device *pdev` |
+| NULL | 許容する。失敗値を返す |
+| `pdev->pd_dev` | NetBSDの実device (`device_t`) であること。NULLは失敗 |
+| device handle | `device_handle(pdev->pd_dev)` で取得 |
+| handle種別 | `DEVHANDLE_TYPE_OF` であること |
+| handle検査 | `devhandle_to_of()` を呼ぶ前に種別を検査する |
+
+このhelperは `pdev->dev.bsdev`、`struct device.of_node`、`device_private()` を直接参照してはならない。`pd_dev` がNetBSD側の実deviceであるというplatform deviceの既存契約を利用する。
+
+#### 10.19.4 戻り値契約
+
+| 戻り値 | 意味 | 呼び出し側の処理 |
+|---|---|---|
+| `>= 0` | OF/FDT node値を取得できた | FDT/OF APIへ渡す |
+| `-1` | 引数または実deviceがNULL、またはhandleがOF型でない | 呼び出し側で適切なerrnoへ変換する |
+
+`-1` はこのhelper固有の失敗値であり、Linux errnoを直接返すものではない。呼び出し側はこの値を `-ENXIO` 等へ変換し、`-1` をそのまま上位のprobe/bind戻り値として返さない。
+
+成功時のnode値はNetBSDのOF node識別子であり、Linux `struct device_node *` ではない。node値をポインタへcastしたり、Linux OF APIへそのまま渡してはならない。
+
+#### 10.19.5 所有権・寿命・並行性
+
+- node値はdevice handleから得た識別値であり、helperはnodeやFDT blobの参照カウントを増減しない。
+- 呼び出し側はこの戻り値に対して `of_node_put()`、`of_node_get()` を呼ばない。
+- 戻り値はFDT nodeの存在を表す識別値であり、DDC controllerやGPIO pin等の資源所有権を表さない。
+- DDC/GPIO等の資源は、それぞれのNetBSD APIで個別に取得・解放する。
+- helperは状態を保持せず、global cacheやstatic mutable dataを導入しない。
+- `pdev` と `pdev->pd_dev` の寿命・attach順序は呼び出し側が保証する。helper自体はdevice detachとの同期を行わない。
+
+#### 10.19.6 エラー分類
+
+helperが返す `-1` は、NULL入力または非OF handleをまとめた結果である。詳細な原因を区別する必要がある場合は、helperの責務を拡張せず、呼び出し側で入力を検査して診断メッセージを出す。
+
+node取得成功後のproperty・phandle・資源取得失敗はhelperのエラーではない。例えば:
+
+- `ddc` propertyがない: FDT property解決側のエラー。
+- phandle先のI2C controllerがまだ登録されていない: I2C attach順序・再試行側の問題。
+- `hpd-gpios` がない、またはGPIO controllerが利用できない: GPIO property/acquire側の問題。
+
+これらを `platform_device_of_node()` の戻り値に混在させない。
+
+#### 10.19.7 呼び出し側の標準パターン
+
+```c
+int node;
+
+node = platform_device_of_node(pdev);
+if (node < 0) {
+        device_printf(pdev->pd_dev,
+            "device has no OF/FDT node\\n");
+        return -ENXIO;
+}
+
+/* node is a NetBSD OF/FDT node identifier. */
+ddc_node = fdtbus_get_phandle(node, "ddc");
+if (ddc_node < 0)
+        return -ENODEV;
+```
+
+上記はAPIの使用例であり、`fdtbus_get_phandle()` の戻り値やDDC adapter取得の実装は別途NetBSD側APIの契約に従う。node取得helperの成功をもってDDC controllerの存在・登録完了を仮定してはならない。
+
+#### 10.19.8 実装時の受け入れ条件
+
+実装パッチは次の条件を満たすこと。
+
+1. `platform_device.h` に宣言・定義があり、必要な型・関数宣言を正しいヘッダーから取得する。
+2. `pdev == NULL` と `pdev->pd_dev == NULL` を安全に拒否する。
+3. `device_handle()` の結果が `DEVHANDLE_TYPE_OF` であることを確認してから `devhandle_to_of()` を呼ぶ。
+4. 非OF handleに対して `devhandle_to_of()` を呼ばず、KASSERTを発生させない。
+5. 成功時は `devhandle_to_of()` の結果をそのまま返し、ポインタ変換や独自node番号変換を行わない。
+6. `struct device` に `of_node` を追加せず、`pdev->dev.bsdev` に依存しない。
+7. 呼び出し側で失敗値をerrnoに変換し、成功nodeに対する `of_node_put()` を削除する。
+8. VC4 HDMIの実際の `pdev->pd_dev` がOF型handleを持つことを、ビルドに加えて診断ログまたは実機で確認する。
+
+#### 10.19.9 仕様上の未確定事項
+
+本仕様はhelperの入力・出力・所有権を定義するものであり、VC4 HDMIのplatform device生成側が `pd_dev` にどのdevice handleを設定するかまでは保証しない。実装時にFDT node取得が失敗した場合は、helperを緩めて別メンバーを推測参照するのではなく、platform device生成・登録経路を調査する。
+
+また、本helperの戻り値は現時点で `int` / `-1` とする設計である。NetBSDのOF node値に負値が使われないことを対象ブランチのAPI契約で再確認する。将来、より明確なエラー伝達が必要になった場合は、戻り値とnode出力引数を分離するAPIへの変更を検討し、その際は呼び出し側を含めて仕様を更新する。
+
+この仕様書の追加時点では、helper本体のC実装・コンパイル・実機動作確認は未実施である。
