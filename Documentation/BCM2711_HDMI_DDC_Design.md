@@ -1691,3 +1691,78 @@ git diff --check
 GitHub Actionsでは、`vc4_hdmi.c` のコンパイルコマンドを確認し、`-DCONFIG_DRM_VC4_HDMI_AUDIO` と `-DCONFIG_DRM_VC4_HDMI_CEC` の有無を記録する。必要ならコンパイル時の `-dM -E` 相当のプリプロセッサマクロ一覧も確認する。
 
 現時点では、ビルド設定ファイルへの追加変更は行わない。Audio/CECのどちらも `files.drmkms` から有効化されていないことを確認できたため、まずActionsの実コンパイル条件を確定する。映像/DDC経路を維持したままAudio/CECをopt-inにする既存方針は維持する。
+
+
+### 10.16 GitHub Actions #79の実コンパイルコマンドによるAudio / CEC条件の確定
+
+10.15節で未確定としていた「Actionsが実際にどのマクロ条件で `vc4_hdmi.c` をコンパイルしたか」について、GitHub Actions #79のjob logを取得して確認した。
+
+#### 10.16.1 調査対象
+
+- Repository: `ebijun/src`
+- Branch: `vc4-drmkms`
+- Workflow run: [Actions #79](https://github.com/ebijun/src/actions/runs/45304333435)
+- Run ID: `45304333435`
+- Job: `build-kernel`
+- Job ID: `138144332177`
+- 対象step: `Build Tools and Kernel (earmv7hf)`
+- コンパイル対象: `sys/external/bsd/drm2/dist/drm/vc4/vc4_hdmi.c`
+- コンパイラ: `armv7--netbsdelf-eabihf-gcc`
+
+#### 10.16.2 実際のコンパイルコマンド
+
+job logの `vc4_hdmi.o` compile行を確認した。主要な部分は次の通り。
+
+```sh
+/home/runner/work/src/src/./tools/bin/armv7--netbsdelf-eabihf-gcc \
+    -mfloat-abi=soft -mapcs-frame -ffreestanding \
+    -std=gnu11 -Werror -Wall -Wpointer-arith \
+    -nostdinc \
+    -DCOMPAT_UTILS -DARM_GENERIC_TODR \
+    -DDIAGNOSTIC -DDRM2 -D_KERNEL -D_KERNEL_OPT \
+    -I.../sys/external/bsd/drm2/include \
+    -I.../sys/external/bsd/drm2/include/sound \
+    -I.../sys/external/bsd/drm2/include/media \
+    -I.../sys/external/bsd/drm2/dist/include \
+    -I.../sys/external/bsd/drm2/dist/drm/vc4 \
+    -c .../sys/external/bsd/drm2/dist/drm/vc4/vc4_hdmi.c \
+    -o vc4_hdmi.o
+```
+
+ログの実コマンド全体を検査した結果:
+
+| マクロ | compile command内の `-D` | 判定 |
+|---|---|---|
+| `CONFIG_DRM_VC4_HDMI_AUDIO` | なし | 未定義 |
+| `CONFIG_DRM_VC4_HDMI_CEC` | なし | 未定義 |
+
+job log全体にもこれらのマクロ名は現れなかった。したがって、少なくともRun #79の `vc4_hdmi.c` コンパイルでは、AudioとCECの両マクロは定義されていない。通常のCプリプロセッサ動作により、両方の `#ifdef` ブロックは除外された状態でコンパイルされたと判断できる。
+
+#### 10.16.3 この確認から確定したビルド条件
+
+Run #79の実ビルド条件は次の通り。
+
+- HDMI Audio: 無効（`CONFIG_DRM_VC4_HDMI_AUDIO` 未定義）。
+- HDMI CEC: 無効（`CONFIG_DRM_VC4_HDMI_CEC` 未定義）。
+- HDMI本体、connector、DDC/EDID等の共通コード: `vc4_hdmi.c` のコンパイル対象。
+- sound/media include path: コンパイルコマンドには存在するが、これらのinclude pathは機能を有効化するdefineではない。
+- コンパイルは `-Werror` と `-Wpointer-arith` を有効にして実行されている。
+
+これにより、10.15節で残していた「Actionsの実コンパイルコマンドにdefineが含まれているか」という未確定事項は、Run #79について解消した。Audio/CECの無効化は、単に `files.drmkms` の記述から推測したものではなく、CIの実コマンドから確認できた。
+
+#### 10.16.4 ビルド失敗との関係
+
+Run #79は成功ではない。job logでは `vc4_hdmi.o` の失敗として、少なくとも次のNetBSD/LinuxKPI境界の不足が報告されている。
+
+- `of_find_i2c_adapter_by_node()`、`of_node_put()`、`of_find_property()`、`of_get_named_gpio_flags()` の宣言不足。
+- `EPROBE_DEFER)、`OF_GPIO_ACTIVE_LOW`、`enum of_gpio_flags` の不足。
+- NetBSD LinuxKPIの `struct device` に `of_node` がない。
+- `pm_runtime_enable()`、`put_device()` の宣言不足。
+
+これらはAudio/CECを無効にした状態でも残る問題であり、Audio/CECの条件設定が原因ではない。次の作業ではOF/FDT、I2C adapter参照、GPIO、Runtime PM、device参照寿命の境界を個別に扱う。
+
+#### 10.16.5 適用範囲と注意
+
+この結論は、Run #79の対象commitに対する `earmv7hf / evbarm / GENERIC` ビルドの実測結果である。異なるcommit、別のkernel config、別アーキテクチャの全ビルド条件まで自動的に保証するものではない。今後のCIで同じ条件を維持する場合は、各runの `vc4_hdmi.c` compile commandを確認する。
+
+現時点では、Audio/CECを有効化する変更も、無効化のための追加define変更も不要である。現行CIの実条件は既に両機能無効であり、次の修正対象は `vc4_hdmi.c` のOF/FDT・I2C・GPIO・Runtime PM依存とする。
