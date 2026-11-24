@@ -1,6 +1,6 @@
 # NetBSD BCM2711 HDMI DDC / VC4 DRM2対応 設計書
 
-- 文書バージョン: 0.7
+- 文書バージョン: 0.8
 - 作成日: 2026-11-22
 - 最終更新日: 2026-11-24
 - 対象リポジトリ: [https://github.com/ebijun/src](https://github.com/ebijun/src)
@@ -1296,3 +1296,153 @@ VC4側ヘッダー `vc4_drv.h` の宣言はLinux形式の `irqreturn_t vc4_irq(i
 - 変更前に対象関数の全参照元とcleanup経路を確認し、変更後は `git diff --check` と対象差分をレビューする。
 - GitHub Actionsはコンパイル検証であり、実機のHDMI表示、EDID取得、割り込み動作を証明するものではない。
 - まず表示に必要な最小構成を明確にし、Audio/CEC/debugfs/V3D等のoptional機能とHDMI映像経路を分離して段階的に有効化する。
+
+
+### 10.12 NetBSD DRM cdevsw / ioctl / mmap経路の追加調査
+
+10.11で次の調査項目としたDRM device node/file operationsについて、NetBSD DRM2の実装を追跡した結果を記録する。今回の調査で、Linuxの `struct file_operations` をNetBSD側に追加する必要はなく、VC4 driver側ではLinux専用 `.fops` をNetBSDビルドから除外する方向が妥当であることが確認できた。一方、NetBSD DRMのmmap callbackはVC4側に別途実装・接続する必要がある。
+
+調査した主なファイル:
+- `sys/external/bsd/drm2/drm/drm_cdevsw.c`
+- `sys/external/bsd/drm2/dist/drm/drm_drv.c`
+- `sys/external/bsd/drm2/dist/drm/drm_ioctl.c`
+- `sys/external/bsd/drm2/dist/drm/drm_file.c`
+- `sys/external/bsd/drm2/drm/drm_gem_vm.c`
+- `sys/external/bsd/drm2/dist/drm/drm_prime.c`
+- `sys/external/bsd/drm2/dist/include/drm/drm_drv.h`
+- `sys/external/bsd/drm2/include/linux/fs.h`
+
+#### 10.12.1 NetBSDのDRM file operationsは共通cdevswが担当する
+
+NetBSD DRM2には `sys/external/bsd/drm2/drm/drm_cdevsw.c` があり、ここでDRM共通の `drm_cdevsw` と `drm_fileops` が定義されている。
+
+- `drm_cdevsw` はデバイス番号からDRM minorを取得するopen entry pointを提供する。
+- open成功時に `drm_file_alloc(dminor)` で `struct drm_file` を作成し、NetBSDの `fd_clone()` で `drm_fileops` を使うfile descriptorを構成する。
+- `drm_fileops` はNetBSDの `fo_read`、`fo_ioctl`、`fo_poll`、`fo_close`、`fo_kqfilter`、`fo_mmap` 等を持つ。
+- closeはNetBSD側の `drm_close()` がfile contextを解放し、open countとlast-close処理を管理する。
+
+この経路はLinuxの `drm_stub_open()` がdriverの `file_operations` に切り替える方式とは異なる。NetBSDではDRM core共通のcdevsw/fileopsがDRM file descriptorの入口となり、個々のdriverがLinux `struct file_operations` を供給する設計ではない。
+
+したがって、Run #75で問題となった `vc4_drm_fops` はNetBSD用に代替定義するのではなく、Linux専用定義とdriver初期化子を次のように隔離する方針が妥当である。
+
+```c
+#ifndef __NetBSD__
+static const struct file_operations vc4_drm_fops = {
+        .owner = THIS_MODULE,
+        .open = drm_open,
+        .release = drm_release,
+        .unlocked_ioctl = drm_ioctl,
+        .mmap = vc4_mmap,
+        .poll = drm_poll,
+        .read = drm_read,
+        .compat_ioctl = drm_compat_ioctl,
+        .llseek = noop_llseek,
+};
+#endif
+
+static struct drm_driver vc4_drm_driver = {
+        /* common DRM callbacks */
+#ifndef __NetBSD__
+        .fops = &vc4_drm_fops,
+#endif
+};
+```
+
+これはLinuxのfileops ABIをNetBSD側へ移植する提案ではない。NetBSD DRM coreが独自fileopsを持つため、Linux専用メンバー参照をコンパイル対象から外す提案である。適用時には `vc4_mmap` を含むLinux VMA専用関数がNetBSD側で未使用static function警告を出さないよう、定義範囲も確認する。
+
+#### 10.12.2 NetBSD open/closeとVC4 driver callbackの接続
+
+NetBSDの `drm_cdevsw.c:drm_open()` は `drm_file_alloc()` を呼ぶ。`drm_file_alloc()` は `drm_file.c` にあり、共通GEM/syncobj/PRIME file-private stateを初期化した後、次のdriver callbackを実行する。
+
+```c
+if (dev->driver->open) {
+        ret = dev->driver->open(dev, file);
+        if (ret < 0)
+                goto out_prime_destroy;
+}
+```
+
+したがってVC4の `.open = vc4_open` は、Linuxの `drm_open()` を経由しなくてもNetBSD共通open処理から呼び出される。VC4の `vc4_open()` が確保する `struct vc4_file` と `vc4_close()` 相当の後処理は、NetBSD共通file close pathでどのdriver callbackが呼ばれるかを含めて整合を確認する。Linux `drm_release()` 自体をNetBSD用に定義する必要はない。
+
+#### 10.12.3 ioctl dispatchと `ioctl_override` の意味
+
+NetBSD `drm_cdevsw.c` の `drm_ioctl_shim()` は、driverの `ioctl_override` が設定されていればそれを呼び、未設定なら通常の `drm_ioctl()` を呼ぶ。
+
+通常の `drm_ioctl()` は `drm_ioctl.c` のNetBSD実装であり、ioctl番号が `DRM_COMMAND_BASE` 以上のdriver-private ioctlなら、`drm_driver.ioctls` と `num_ioctls` からdescriptorを選択してdispatchする。これはVC4の次の定義と直接接続する。
+
+```c
+.ioctls = vc4_drm_ioctls,
+.num_ioctls = ARRAY_SIZE(vc4_drm_ioctls),
+```
+
+よって、VC4は通常の `drm_ioctl()` dispatchを利用するため、初期移植で `.ioctl_override` を設定する必要はない。`ioctl_override` はdriver-private ioctlを追加するためのフックではなく、NetBSD cdevswから通常のDRM ioctl処理全体を置き換えるoverrideである。安易に設定すると共通DRM ioctl、permission check、suspend/unplug保護、引数zero-padding等を迂回する危険がある。
+
+#### 10.12.4 NetBSD mmapは `mmap_object` とUVMで実装される
+
+NetBSDの `drm_fileops.fo_mmap` は `drm_cdevsw.c:drm_fop_mmap()` へ入り、次のdriver callbackを呼ぶ。
+
+```c
+error = -(*dev->driver->mmap_object)(dev, *offp, len, prot, uobjp,
+    offp, file->filp);
+```
+
+このcallbackの型は `sys/external/bsd/drm2/dist/include/drm/drm_drv.h` の `__NetBSD__` 分岐で定義されている。
+
+```c
+int (*mmap_object)(struct drm_device *, off_t, size_t, int,
+    struct uvm_object **, voff_t *, struct file *);
+const struct uvm_pagerops *gem_uvm_ops;
+```
+
+NetBSDのGEM mmap実装は `sys/external/bsd/drm2/drm/drm_gem_vm.c` にあり、`drm_gem_mmap_object()` はGEM VMA offsetを検索し、許可されたGEM objectについて `gemo_uvmobj` とoffsetを返す。pager側ではdriverの `gem_uvm_ops` が必要になる。従って `mmap_object` と `gem_uvm_ops` は役割が異なる。
+
+- `mmap_object`: DRM file descriptorのmmap入口から呼ばれる、byte offset/lengthをUVM objectへ変換するdriver/core callback。
+- `gem_uvm_ops`: GEM objectのUVM pager operation。GEM objectのfault/reference/detach等を処理する。
+- `gem_prime_mmap`: PRIME dma-buf mmap用callback。NetBSDではUVM引数を受け取る別ABIである。
+
+現在のVC4 driver initializerはNetBSD用 `.gem_uvm_ops = &drm_gem_cma_uvm_ops` を設定しているが、確認した `vc4_drm_driver` 初期化子には `.mmap_object` の指定がない。NetBSDの `drm_fop_mmap()` は `mmap_object` を直接呼ぶため、これを別途接続しないままではmmap時に成立しない。次の実装前に、VC4 GEM objectがCMA pagerを利用する条件と既存の `drm_gem_mmap_object()` / `drm_gem_or_legacy_mmap_object()` のどちらが適切かを確定する。単純に関数ポインタをcastしてはならない。
+
+#### 10.12.5 PRIME mmap callbackの型差と既存NetBSD helper
+
+`drm_driver.gem_prime_mmap` はNetBSDとLinuxで異なる型を持つ。NetBSD側は `off_t *`、`size_t`、`prot`、`uvm_object **` 等を受け取り、Linux側は `struct vm_area_struct *` を受け取る。
+
+NetBSDの `drm_prime.c:drm_gem_prime_mmap()` はNetBSD ABIで実装され、GEM objectの `obj->funcs->mmap` があればそれを呼ぶ。なければ `driver->mmap_object` に処理を委譲する。Linux側の `fops->mmap` へは進まない。
+
+Run #75で `vc4_prime_mmap` と `drm_driver.gem_prime_mmap` の関数ポインタ型不一致が出たため、VC4側のLinux VMA callbackをそのまま登録することはできない。対応方針は以下のとおり。
+
+1. VC4の `vc4_prime_mmap` の実装内容とGEM object function tableを確認する。
+2. NetBSD UVM ABIで同等の処理を実装できるか確認する。
+3. 標準 `drm_gem_prime_mmap()` へ委譲できるなら、そのNetBSDシグネチャを使う。
+4. object-specific mappingが必要ならNetBSD専用wrapperを作り、offset、length、protection、UVM object参照の契約を明示する。
+
+関数ポインタcastやダミーcallbackでコンパイルエラーを隠すことは禁止する。
+
+#### 10.12.6 `vc4_drv.c` に対する修正候補と未確定事項
+
+今回の調査から、`vc4_drv.c` のfile operations部分は次の小さな変更候補として確定できた。
+
+- `vc4_drm_fops` 定義を `#ifndef __NetBSD__` で囲む。
+- `drm_driver` 初期化子の `.fops = &vc4_drm_fops` も `#ifndef __NetBSD__` で囲む。
+- NetBSD用の `struct file_operations`、`drm_open`、`drm_release`、`noop_llseek` を追加しない。
+- `.ioctls` / `.num_ioctls` は残す。NetBSD DRM cdevswが通常の `drm_ioctl()` を経由してdriver-private ioctlをdispatchするためである。
+- `.open = vc4_open` / `.postclose = vc4_close` はDRM coreのdriver callbackであり、Linux fileopsのopen/releaseとは別物なので残す。
+
+ただし、以下はまだ実装判断を確定していない。
+
+- VC4の `mmap_object` に適切なNetBSD GEM/legacy mapping helper。
+- `vc4_prime_mmap` のNetBSD UVM callback実装または標準helperへの置換。
+- `vc4_mmap` とLinux `vm_operations_struct` 依存コードをどこまでNetBSDビルドから除外するか。
+- NetBSDの `drm_file_alloc()` / `drm_file_free()` とVC4 `open/postclose` callbackの対応関係を含むclose lifecycleの最終確認。
+
+#### 10.12.7 次の作業
+
+次の変更は `vc4_drv.c` のLinux-only fops隔離だけに限定する。mmap callbackやcomponent frameworkを同じcommitで変更しない。
+
+1. `vc4_drm_fops` 定義と `.fops` 初期化子をNetBSDビルドから隔離する。
+2. `vc4_mmap` 等Linux VMA専用関数のunused warningを確認する。
+3. `git diff --check` と差分確認を行う。
+4. GitHub Actionsで `vc4_drv.o` のfile_operations関連エラーが消えることを確認する。
+5. 次の独立課題として `mmap_object` と `gem_prime_mmap` のNetBSD UVM接続を設計する。
+6. その後にcomponent master orchestrationへ進む。
+
+この段階のゴールはVC4 DRMのNetBSD fileopsを実装することではなく、NetBSD DRM2が既に提供するcdevsw/fileops経路を正しく利用し、Linux専用 `.fops` ABIへの不要な依存を取り除くことである。
