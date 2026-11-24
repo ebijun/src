@@ -1920,3 +1920,124 @@ NetBSDのGPIOは整数番号を返すLinux legacy GPIO APIとは異なり、pin 
 - 第4段階: Audioを有効化する段階でのみ `dmas` と `reg` の取得helperを実装する。
 
 本節は現行ソースの照合結果と設計判断であり、まだCソースの修正やカーネルビルドを実施したものではない。次のパッチでは、まず第1段階のnode番号取得境界を最小変更で実装し、コンパイル結果を確認してからI2C/GPIOへ進む。
+
+
+### 10.18 FDT node取得helperの設計
+
+10.17節の照合結果を踏まえ、VC4 Linux-KPI側からNetBSD FDT nodeを取得するhelperを設計する。本節ではAPI契約と配置、呼び出し側の変更案を定義する。実装パッチやビルド検証はまだ行わない。
+
+#### 10.18.1 設計方針
+
+FDT nodeはLinuxの `struct device_node *` として保持せず、NetBSDのOF phandle整数値（`int`）として扱う。理由は次の通り。
+
+- NetBSD `device_t` は `device_handle()` から `devhandle_t` を取得できる。
+- FDT/OFデバイスのhandle種別は `DEVHANDLE_TYPE_OF` で識別できる。
+- `devhandle_to_of()` はOF型handleを整数node値に変換する。
+- NetBSD `fdtbus_*` / `of_*` APIは整数node値を受け取る。
+- NetBSD側にはLinux `device_node` のget/put参照カウントをそのまま適用する根拠がない。
+
+特に現行 `struct device` は `device_t bsdev` のみを持つ。現行 `platform_device` は `pd_dev` と `dev` を別メンバーとして持つが、`pd_dev` から `dev.bsdev` への初期化・同期を保証する実装は今回確認できていない。そのため、`dev->bsdev` を前提にする汎用helperや、`struct device` に `of_node` を追加する案は採用しない。
+
+#### 10.18.2 helperの配置とAPI契約
+
+helperは `sys/external/bsd/drm2/include/linux/platform_device.h` に置く。現状のVC4呼び出し元は `to_platform_device(dev)` で `struct platform_device *` を得ており、NetBSD固有の実deviceは `pdev->pd_dev` に明示的に存在するためである。
+
+提案するAPI:
+
+```c
+static inline int
+platform_device_of_node(const struct platform_device *pdev)
+{
+        devhandle_t handle;
+
+        if (pdev == NULL || pdev->pd_dev == NULL)
+                return -1;
+
+        handle = device_handle(pdev->pd_dev);
+        if (devhandle_type(handle) != DEVHANDLE_TYPE_OF)
+                return -1;
+
+        return devhandle_to_of(handle);
+}
+```
+
+必要な宣言・include:
+
+```c
+#include <sys/device.h>
+#include <dev/ofw/openfirm.h>
+```
+
+`sys/device.h` は `devhandle_t`、`device_handle()`、`devhandle_type()`、`DEVHANDLE_TYPE_OF` を提供する。`<dev/ofw/openfirm.h>` は `devhandle_to_of()` を宣言する。
+
+戻り値契約:
+
+- 0以上: NetBSD OF/FDT node値。呼び出し元はそのまま `fdtbus_*` / `of_*` APIへ渡す。
+- -1: platform deviceがNULL、`pd_dev` がNULL、またはdevice handleがOF型ではない。
+- node値は借用した整数値であり、helperは参照取得・解放を行わない。
+- 呼び出し側は `of_node_put()` 相当を呼ばない。
+
+`devhandle_to_of()` 自体は内部で `KASSERT(devhandle_type(handle) == DEVHANDLE_TYPE_OF)` を行うため、helper内で種別を確認してから呼ぶ。非OF handleを直接渡してはならない。
+
+#### 10.18.3 VC4 HDMIでの使用方法
+
+現行 `vc4_hdmi_bind()` は既に `struct platform_device *pdev` を取得している。したがって、nodeを必要とする共通処理では次のように置き換える。
+
+```c
+int node;
+
+node = platform_device_of_node(pdev);
+if (node < 0) {
+        DRM_ERROR("device has no OF/FDT node\\n");
+        return -ENXIO;
+}
+
+ddc_node = fdtbus_get_phandle(node, "ddc");
+if (ddc_node < 0) {
+        DRM_ERROR("Failed to find ddc node in device tree\\n");
+        return -ENODEV;
+}
+```
+
+この後のDDC I2C adapter bridgeは別段階であり、`ddc_node` を取得できたことだけでLinux `struct i2c_adapter *` が得られるわけではない。
+
+HPD GPIOについても同じ `node` をproperty検索の起点として使用する。ただしGPIO取得は `fdtbus_gpio_acquire(node, "hpd-gpios", ...)` とopaque pin objectの保持に変更する必要があり、このhelper設計だけではGPIO部分は完成しない。
+
+Audio専用 `vc4_hdmi_audio_init()` は `struct device *dev` しか直接受け取らないため、実装時には `to_platform_device(dev)` から `pdev` を得て同じhelperを使うか、Audio初期化関数の引数を `struct platform_device *pdev` に変更する。現行CIではAudioが無効なので、Audio対応は後段とする。
+
+#### 10.18.4 このhelperをplatform_device限定にする理由
+
+現行 `struct device` は `bsdev` を持つが、platform deviceの実deviceは `pd_dev` である。現時点で両者の同一性・初期化順序がコード上で保証されていることを確認できていない。したがって、次のような実装は避ける。
+
+```c
+/* 採用しない: bsdevの初期化を確認できていない */
+node = devhandle_to_of(device_handle(dev->bsdev));
+```
+
+また、`to_platform_device()` は現在 `device_private(self)` を返すNetBSD固有の実装である。helperに渡す `pdev` は、この既存変換が正しくplatform deviceを返す呼び出し経路に限定する。通常のLinux `struct device *` 全般に適用できるAPIとして公開しない。
+
+#### 10.18.5 エラー処理とprobe延期の扱い
+
+node取得失敗と、DDC controller未登録は別のエラーである。
+
+| 状態 | helper/API結果 | 呼び出し側の扱い |
+|---|---|---|
+| platform device / pd_devなし | `-1` | device構成異常として `-ENXIO` 等で失敗 |
+| handleがOF型ではない | `-1` | FDT deviceではないため失敗 |
+| nodeは取得できるが `ddc` propertyなし | `fdtbus_get_phandle()` が負値 | device tree設定不備として `-ENODEV` |
+| ddc phandleはあるがI2C controller未登録 | `fdtbus_i2c_get_tag()` 等がNULL | probe/bind延期の仕組みが別途必要 |
+| DDC controllerが登録済み | NetBSD `i2c_tag_t` | Linux-KPI adapter bridgeへ渡す |
+
+Linuxの `-EPROBE_DEFER` を返すだけでNetBSD component frameworkが自動的にprobeを再実行するとは限らない。controller未登録時の再試行・attach順序は、FDT attachとcomponent bindの実際の呼び出し順を確認して別途設計する。
+
+#### 10.18.6 実装前チェックリスト
+
+- [ ] `platform_device.h` に `<dev/ofw/openfirm.h>` を追加し、上記helperを実装する。
+- [ ] `device_handle(pdev->pd_dev)` がVC4 HDMI deviceについてOF型handleを返すことを確認する。
+- [ ] `platform_device_of_node()` の戻り値が有効なFDT nodeであることを確認する。
+- [ ] `vc4_hdmi_bind()` のDDC property取得を `fdtbus_get_phandle()` に置き換える。
+- [ ] `of_node_put()` を削除する（node整数値に参照解放は不要）。
+- [ ] `struct device` に `of_node` や未初期化の `bsdev` 依存を追加しない。
+- [ ] I2C adapter bridgeとHPD GPIO変換は別パッチで実装・検証する。
+
+このhelperはFDT node番号を得るための最小境界であり、Linux OF API全体の互換層ではない。実装後はまずコンパイルし、次に実機または診断ログで `pdev->pd_dev` のhandle種別とnode値を確認する。現段階ではドキュメント上の設計提案であり、ソースコードは未変更である。
