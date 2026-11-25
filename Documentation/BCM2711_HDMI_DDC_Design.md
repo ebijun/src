@@ -3635,3 +3635,175 @@ The eight-step investigation changes the implementation direction for the select
 Accordingly, **do not proceed to importing the four missing v5.6 VC4 source files or adding eight VC4 CFATTACH entries for RPi4**. The next correct milestone is to choose the hardware target definitively (RPi4/VC5 versus an earlier BCM2835/BCM2837/VC4 board), then establish the matching upstream driver generation. For RPi4, investigate/import the BCM2711 VC5-capable driver architecture, implement firmware clocks and HDMI DDC support, and only then define its component registry and KMS handoff.
 
 This section records source-DTS analysis and design decisions. No compiled DTB, runtime FDT dump, resource reservation test, clock provider implementation, HDMI DDC driver, CFATTACH/config entry, component registry, or console handoff code was created or built in this task.
+
+
+### 10.26 Raspberry Pi 4 / BCM2711 VC5 upstream driver調査
+
+調査日: 2026-11-25。NetBSD対象branch `vc4-drmkms` の現行ソース、Linux upstream `v5.6` tag、およびLinux upstream `master` のVC4/VC5・V3D・clock・I2C実装を照合した。upstream masterは移動する参照なので、調査時の各ファイルblob SHAも記録する。
+
+#### 10.26.1 結論 — VC5は独立した `vc5/` driverではなくVC4 DRM driver内のgeneration
+
+前節10.25の「RPi4はVC5なのでVC4 driverとは別のportが必要」という表現を修正する。Linux upstreamでは、BCM2711 VC5 display pipelineは引き続き `drivers/gpu/drm/vc4/` のVC4 DRM driverで扱われる。独立した `drivers/gpu/drm/vc5/` driverは存在しない。
+
+現在のupstream `vc4_drv.c` は次の2つのDRM driver descriptorを持つ。
+
+- `vc4_drm_driver`: VC4 generation用。legacy VC4 V3D command submission/ioctl、VC4 GEM pathを持つ。
+- `vc5_drm_driver`: VC5以降用。DRM_MODESET / DRM_ATOMIC / DRM_GEMを使い、GEM DMA dumb-buffer pathを使う。VC4 legacy command submission ioctl群を登録しない。
+
+master probeはFDT match dataからgenerationを取得し、`gen > VC4_GEN_4` なら `vc5_drm_driver` を選ぶ。master compatibleには `brcm,bcm2711-vc5` が含まれる。
+
+したがってNetBSD側の正しい方向は「VC5という別ディレクトリを新設する」ことではなく、**現行の古いVC4 importを、BCM2711 generation分岐とその周辺API/部品を含むupstream実装へ段階的に更新・backportする**ことである。もっとも、NetBSD DRM2のDRM API世代はLinux masterより古いため、upstream masterのファイルを丸ごと置換することはできない。Linux v5.6ベースのimportとNetBSD DRM2 APIとの差分を管理しながら、BCM2711対応に必要な変更を選択的に移植する。
+
+#### 10.26.2 Linux v5.6 tagと現行NetBSD importの差
+
+Linux upstream v5.6のVC4 driverを確認すると、master matchは `brcm,bcm2835-vc4` と `brcm,cygnus-vc4` のみで、`brcm,bcm2711-vc5` はない。HVSは `brcm,bcm2835-hvs`、HDMIは `brcm,bcm2835-hdmi`、CRTCはBCM2835 PixelValve0/1/2だけをmatchする。
+
+| file | Linux v5.6のBCM2711/VC5対応 | 現行NetBSD branchの状態 |
+|---|---|---|
+| `vc4_drv.c` | `bcm2711-vc5` matchなし、VC5 DRM descriptorなし | v5.6相当の古いmatch。VC5対応なし |
+| `vc4_hvs.c` | BCM2835 HVSのみ | sourceあり。BCM2711 HVS matchなし |
+| `vc4_hdmi.c` | BCM2835 HDMIのみ | sourceあり。BCM2711 HDMI0/1 matchなし |
+| `vc4_crtc.c` | BCM2835 PV0/1/2のみ | sourceあり。BCM2711 PV0..4 matchなし |
+| `vc4_txp.c` | BCM2835 TXP | NetBSD branchにsourceなし、files登録なし |
+| `vc4_vec.c` | BCM2835 VEC | NetBSD branchにsourceなし、files登録なし |
+| `vc4_dpi.c` | BCM2835 DPI | NetBSD branchにsourceなし、files登録なし |
+| `vc4_dsi.c` | BCM2835 DSI1 | NetBSD branchにsourceなし、files登録なし |
+| `vc4_v3d.c` | VC4 generation向けV3D component | sourceあり。BCM2711 V3D compatibleなし |
+
+Linux v5.6 tagの参照blob:
+
+| upstream v5.6 file | blob SHA |
+|---|---|
+| `drivers/gpu/drm/vc4/vc4_drv.c` | `5e6fb6c2307f0d59cd51c6841c20ec5beac25c29` |
+| `drivers/gpu/drm/vc4/vc4_hvs.c` | `5a43659da31934d79c133f1d202ed04431cee4d6` |
+| `drivers/gpu/drm/vc4/vc4_hdmi.c` | `cea18dc15f77cdb3a7b6ab74f296ab54faae56ef` |
+| `drivers/gpu/drm/vc4/vc4_crtc.c` | `b00e20f5ce050262adb403ccfda4f362641d2205` |
+| `drivers/gpu/drm/vc4/vc4_txp.c` | `bf720206727f08d3b72454133dd4e1f8d51ad909` |
+| `drivers/gpu/drm/vc4/vc4_vec.c` | `7402bc768664ccd47d66e5168769784d52fd20b8` |
+| `drivers/gpu/drm/vc4/vc4_dpi.c` | `c586325de2a5bd09589eb28cdb636b7aed68fbfd` |
+| `drivers/gpu/drm/vc4/vc4_dsi.c` | `fd8a2eb60505389e637c6bb88ce29570f66adc88` |
+
+NetBSD branch `sys/arch/arm/broadcom/files.bcm2835` は `vc4_fdt.c` のmaster CFATTACHだけを登録している。DRM2 `files.drmkms` はVC4の `vc4_drv.c`, `vc4_kms.c`, `vc4_crtc.c`, `vc4_hdmi.c`, `vc4_hvs.c`, `vc4_plane.c`, `vc4_v3d.c` を登録する。現在の `vc4_drv.c` の `component_drivers[]` と `vc4_drv.h` のexternにはTXP/VEC/DPI/DSIが現れる一方、これら4つの実装ファイルはbranchに存在せず、`files.drmkms` にも登録されていない。従って、現状はLinux v5.6の全8 component sourceを揃えた状態ですらない。VC5対応の前に、未取り込み4ファイルの有無だけでなく、参照シンボル・Makefile相当のkernel file登録・依存APIを一緒に整合させる必要がある。
+
+#### 10.26.3 現行Linux upstreamのVC5 master構成
+
+現行upstream `drivers/gpu/drm/vc4/vc4_drv.c` の主要処理:
+
+1. `vc4_of_match[]` が `brcm,bcm2711-vc5` を `VC4_GEN_5` としてmatchする。
+2. `vc4_drm_bind()` がgenerationに応じてVC4/VC5のDRM descriptorを選ぶ。
+3. mode_config等を初期化し、firmware display通知を行う。
+4. `component_bind_all()` で各表示componentをbindする。
+5. 追加planeを作り、`vc4_kms_load()` でKMSを初期化する。
+6. boot時のCRTC状態を停止し、DRM deviceを登録し、DRM clientをsetupする。
+
+VC5ではVC4 legacy GEM/command submission初期化を行わない条件分岐がある。従ってNetBSD側でVC5を有効化する際に、VC4のV3D legacy ioctl/GEM処理をそのままVC5に有効化してはならない。
+
+upstream masterのcomponent driver配列は次の順序である。
+
+```c
+static struct platform_driver *const component_drivers[] = {
+        &vc4_hvs_driver,
+        &vc4_hdmi_driver,
+        &vc4_vec_driver,
+        &vc4_dpi_driver,
+        &vc4_dsi_driver,
+        &vc4_txp_driver,
+        &vc4_crtc_driver,
+        &vc4_v3d_driver,
+};
+```
+
+upstreamコメントで明示される順序制約:
+
+- HVSはHDMIより先。HDMI bindがHVSの最大core clock rateを参照するため。
+- TXPはHVSより後、PixelValve/CRTCより前。TXPがCRTCのpossible_crtc設定に影響するため。
+
+この順序はLinux component frameworkのbind順序であり、NetBSD FDT childのCFATTACH attach順序そのものではない。NetBSDでは各FDT nodeのattachを先に完了させ、OF nodeをキーにしたregistryへ登録し、master側で上記依存順にbindする方式が適切である。
+
+#### 10.26.4 RPi4でmatchするupstream componentとoptional component
+
+現行upstream masterのcompatible tableをRPi4 base DTSと照合した結果:
+
+| logical block | upstream source | RPi4 compatible | upstream match | RPi4 base DTS |
+|---|---|---|---|---|
+| master | `vc4_drv.c` | `brcm,bcm2711-vc5` | VC5 generation | enabled |
+| HVS | `vc4_hvs.c` | `brcm,bcm2711-hvs` | yes | enabled |
+| HDMI0 | `vc4_hdmi.c` | `brcm,bcm2711-hdmi0` | yes | enabled |
+| HDMI1 | `vc4_hdmi.c` | `brcm,bcm2711-hdmi1` | yes | enabled |
+| PixelValve0 | `vc4_crtc.c` | `brcm,bcm2711-pixelvalve0` | yes | enabled |
+| PixelValve1 | `vc4_crtc.c` | `brcm,bcm2711-pixelvalve1` | yes | enabled |
+| PixelValve2 | `vc4_crtc.c` | `brcm,bcm2711-pixelvalve2` | yes | enabled |
+| PixelValve4 | `vc4_crtc.c` | `brcm,bcm2711-pixelvalve4` | yes | enabled |
+| PixelValve3 | `vc4_crtc.c` | `brcm,bcm2711-pixelvalve3` | yes | disabled |
+| TXP | `vc4_txp.c` | `brcm,bcm2835-txp` | yes | node is present; confirm final runtime status |
+| VEC | `vc4_vec.c` | `brcm,bcm2711-vec` | yes | disabled |
+| DPI | `vc4_dpi.c` | `brcm,bcm2835-dpi` | yes | disabled |
+| DSI1 | `vc4_dsi.c` | `brcm,bcm2711-dsi1` | yes | disabled |
+| V3D | separate `drivers/gpu/drm/v3d/v3d_drv.c` | `brcm,2711-v3d` | separate V3D driver, not VC4 component match | enabled |
+
+Important distinction: the `vc4_v3d_driver` entry remains in the generic VC4 component list, but its current match table only includes `brcm,bcm2835-v3d` and `brcm,cygnus-v3d`. RPi4's `brcm,2711-v3d` is handled by the separate DRM V3D driver under `drivers/gpu/drm/v3d/`. It must not be treated as the VC4 display master's V3D component. The VC5 display pipeline can be initialized without binding that VC4 legacy V3D component.
+
+This distinction also affects build integration: RPi4 3D acceleration is a separate DRM driver port/build item, not a reason to add `brcm,2711-v3d` to `vc4_v3d_dt_match[]`.
+
+#### 10.26.5 HDMI, DDC, firmware clocks, DVP and interrupts
+
+The upstream RPi4 display path depends on several drivers outside `drivers/gpu/drm/vc4/`:
+
+| function | Linux upstream implementation | RPi4 compatible / purpose | NetBSD work |
+|---|---|---|---|
+| firmware-controlled clocks | `drivers/clk/bcm/clk-raspberrypi.c` | `raspberrypi,firmware-clocks`; clock IDs including core/V3D/HDMI-related outputs | firmware service client + NetBSD FDT clock provider |
+| DVP clock/reset provider | `drivers/clk/bcm/clk-bcm2711-dvp.c` | `brcm,brcm2711-dvp`; HDMI DVP mux/clock/reset | independent clock/reset provider |
+| HDMI DDC I2C | `drivers/i2c/busses/i2c-brcmstb.c` | includes `brcm,bcm2711-hdmi-i2c` | dedicated NetBSD HDMI DDC I2C driver |
+| HDMI HPD/CEC interrupts | `vc4_hdmi.c` + BCM2711 AON interrupt controller | HDMI0/1 interrupt events through AON controller | interrupt mapping and event handling |
+| V3D 4.2 GPU | `drivers/gpu/drm/v3d/v3d_drv.c` | `brcm,2711-v3d` | separate DRM V3D port |
+
+The firmware clock provider is not equivalent to extending `bcm2835_cprman.c`: the consumer's clock phandle identifies the provider. Keep the two providers distinct. Similarly, the DVP clock/reset provider is a separate FDT node and should not be implemented as ad-hoc register writes inside `vc4_hdmi.c`.
+
+The upstream HDMI driver has variant data for HDMI0 and HDMI1, and manages the DRM encoder/connector as part of the HDMI hardware driver. This supports the ownership decision in 10.25.4: do not also attach generic `dispcon_hdmi` as a second connector for the same HDMI output. The DDC adapter is a separate I2C controller device consumed by the HDMI driver.
+
+#### 10.26.6 DPI/DSI/VEC/TXP status and support scope
+
+The current upstream driver has variant support beyond the RPi4 base DTS enabled set:
+
+- VEC includes both `brcm,bcm2835-vec` and `brcm,bcm2711-vec` variants, but RPi4 base DTS leaves VEC disabled.
+- DPI currently matches `brcm,bcm2835-dpi`; the RPi4 base DTS node is disabled. A later board overlay may enable it, but panel/bridge graph and clocks must be checked first.
+- DSI matches `brcm,bcm2711-dsi1` plus older BCM2835 DSI0/DSI1. RPi4 DSI1 is disabled in the base DTS; it has an explicit BCM2711 variant.
+- TXP currently matches `brcm,bcm2835-txp` (plus newer BCM2712 MOP variants). It is not a new BCM2711-specific TXP implementation; the RPi4 DT reuses the BCM2835-compatible TXP block.
+- HVS and PixelValve need BCM2711-specific register/variant data, not only an expanded compatible list.
+
+For first HDMI KMS bring-up, keep the required set minimal: master + HVS + HDMI0/1 + enabled PixelValve components + the TXP component if the runtime DTB exposes it as enabled and the upstream match/bind path requires it. VEC/DPI/DSI should remain optional until enabled by a real board DTB/overlay and their panel/bridge dependencies are available.
+
+#### 10.26.7 Recommended NetBSD porting plan
+
+Do not copy current Linux master wholesale. Use this order:
+
+1. **Freeze the upstream source baseline.** Select the Linux release/commit containing the BCM2711 VC5 support series. The 2020 upstream series titled `drm/vc4: Support BCM2711 Display Pipeline` documents the architectural changes: dual HDMI controllers, more PixelValves, HVS mux/FIFO changes, and HDMI register repartitioning. Record the chosen commit and source blob SHAs in the import notes.
+2. **Resolve the imported VC4 source set.** Add the missing TXP/VEC/DPI/DSI source files only if their dependencies are also ported; reconcile `files.drmkms`, `vc4_drv.h` externs and all driver symbols. Do not leave component array references without linked definitions.
+3. **Port the generation model.** Add a VC5 generation value and match data for `brcm,bcm2711-vc5`; select a VC5-compatible `drm_driver` descriptor without VC4 legacy V3D ioctl/GEM behavior. Adapt to NetBSD DRM2 API version.
+4. **Port HVS + PixelValve BCM2711 variants.** Bring in HVS channel/FIFO/mux allocation changes and PixelValve0..4 variant data. Keep actual enabled PV set from runtime DTB, not all possible nodes.
+5. **Port BCM2711 HDMI0/1.** Include split/named register resources, both HDMI instances, clock/reset dependencies, AON HPD/CEC interrupt mapping, DDC adapter lookup, and HDMI-specific connector ownership.
+6. **Port providers before consumers.** Implement firmware clocks, BCM2711 DVP clock/reset provider, and BCM2711 HDMI DDC I2C adapter before HDMI/HVS bind. Integrate with NetBSD FDT/clock/I2C APIs; do not add success-only Linux-KPI stubs.
+7. **Implement native component coordinator.** FDT CFATTACH should attach/register each hardware node by OF phandle; master uses explicit OF-node association and bind order (HVS, HDMI, optional VEC/DPI/DSI, TXP, PixelValve; V3D separate). Track successful binds and unwind in reverse order.
+8. **Keep V3D separate.** Port `drivers/gpu/drm/v3d/` as its own DRM driver only after VC5 KMS display works; do not force `brcm,2711-v3d` into `vc4_v3d_driver`.
+9. **Console handoff last.** Once KMS modeset works, implement firmware framebuffer/aperture ownership and safe console takeover; do not combine this with the initial component bring-up.
+
+#### 10.26.8 Upstream source references
+
+The following are the upstream source locations used for this investigation. For reproducibility, prefer a fixed Linux tag/commit for the actual import rather than following `master`.
+
+- Linux v5.6 VC4 master: `https://github.com/torvalds/linux/blob/v5.6/drivers/gpu/drm/vc4/vc4_drv.c`
+- Linux current VC4/VC5 master: `https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/vc4/vc4_drv.c`
+- HVS: `https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/vc4/vc4_hvs.c`
+- HDMI: `https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/vc4/vc4_hdmi.c`
+- PixelValve/CRTC: `https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/vc4/vc4_crtc.c`
+- TXP: `https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/vc4/vc4_txp.c`
+- VEC/DPI/DSI: `https://github.com/torvalds/linux/tree/master/drivers/gpu/drm/vc4`
+- Separate V3D: `https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/v3d/v3d_drv.c`
+- Raspberry Pi firmware clocks: `https://github.com/torvalds/linux/blob/master/drivers/clk/bcm/clk-raspberrypi.c`
+- BCM2711 HDMI DDC I2C: `https://github.com/torvalds/linux/blob/master/drivers/i2c/busses/i2c-brcmstb.c`
+- BCM2711 display pipeline upstream series: `https://lists.openwall.net/linux-kernel/2020/07/08/1236`
+- VC4 DRM driver documentation: `https://docs.kernel.org/gpu/vc4.html`
+
+#### 10.26.9 Status
+
+This is a source comparison and porting design update only. No Linux source was imported, no NetBSD C code or `files.drmkms` / `files.bcm2835` was changed, no DTB was rebuilt, and no GitHub Actions build or hardware test was run.
