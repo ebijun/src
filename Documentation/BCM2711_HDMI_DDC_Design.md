@@ -1,8 +1,8 @@
 # NetBSD BCM2711 HDMI DDC / VC4 DRM2対応 設計書
 
-- 文書バージョン: 0.9
+- 文書バージョン: 1.0
 - 作成日: 2026-11-22
-- 最終更新日: 2026-11-24
+- 最終更新日: 2026-11-25
 - 対象リポジトリ: [https://github.com/ebijun/src](https://github.com/ebijun/src)
 - 対象ブランチ: `vc4-drmkms`
 - 対象ハードウェア: Raspberry Pi 4 / BCM2711
@@ -4356,3 +4356,241 @@ No complete DRM2 framebuffer adoption/wsdisplay handoff path has been implemente
 **Immediate next step:** obtain the exact runtime DTB and boot overlay configuration from the target Raspberry Pi 4. After comparing it with the checked-in DTS, implement Phase 1 as a narrowly scoped NetBSD FDT master attach correction (`brcm,bcm2711-vc5`) and a resource/IRQ inventory test. Do not start by enabling every subdriver or by replacing LinuxKPI stubs with no-op success implementations.
 
 No kernel source, `files.bcm2835`, `files.drmkms`, or provider implementation was modified in this investigation. No GitHub Actions build or Raspberry Pi hardware test was run.
+
+
+## 10.29 NetBSD RPi4実機調査とEFI/DTB引き渡し経路（2026-11-25）
+
+この節では、NetBSD 11.99.11 / aarch64 / Raspberry Pi 4 Model B / PFTF UEFI実機で取得した情報と、作業ブランチのNetBSD EFI bootloaderソース、およびPFTF/EDK2の公開仕様を整理する。実機で観測した事実、ソースコードから確定した動作、まだ確認できていない事項を区別する。
+
+### 10.29.1 実機環境と起動設定
+
+対象機はRaspberry Pi 4 Model B、NetBSD 11.99.11 (aarch64)、PFTF Raspberry Pi 4 UEFIである。UEFIのSystem Table Selectionを「ACPI + Device Tree」に設定した状態でNetBSDが起動した。
+
+`/boot/config.txt` の確認内容:
+
+```ini
+arm_64bit=1
+arm_boost=1
+enable_uart=1
+uart_2ndstage=1
+enable_gic=1
+armstub=RPI_EFI.fd
+disable_commandline_tags=1
+disable_overscan=1
+device_tree_address=0x3e0000
+device_tree_end=0x400000
+dtoverlay=miniuart-bt
+dtoverlay=upstream-pi4
+```
+
+ブート領域には `RPI_EFI.fd`、`bcm2711-rpi-4-b.dtb`、`overlays/upstream-pi4.dtbo`、`overlays/miniuart-bt.dtbo`、`start4.elf` 等が存在する。ファイルが存在することは、対象バイナリが実際に読み込まれたことや、実行時DTBの内容・ハッシュを証明するものではない。
+
+ACPI + Device Tree設定でのdmesgでは、次を確認した。
+
+- `armfdt0`、`simplebus0`、`simplebus1` が生成される。
+- `acpifdt0`、`acpi0` が生成され、ACPIテーブルがロードされる。
+- `bcmmbox0`、`vchiq0`、`bsciic0/1` 等のACPIデバイスが列挙される。
+- `genfb0` は1920x1280、32-bpp、物理アドレス `0x3e29a000` でattachする。
+- VC4/VC5 master、HVS、PixelValve、HDMI KMSのattachメッセージは確認できない。
+
+### 10.29.2 実機で取得したFDTの内容
+
+`ofctl -pv` のルートは次の内容だった。
+
+```dts
+/ {
+    compatible = "netbsd,generic-acpi";
+    model = "Raspberry Pi Foundation Raspberry Pi 4 Model B";
+    #address-cells = <2>;
+    #size-cells = <2>;
+};
+```
+
+列挙されたノードは概ね次の構成である。
+
+```
+/
+├── memory@0,400000
+├── acpi
+└── chosen
+    └── framebuffer@0,3e29a000
+```
+
+`/chosen` には `netbsd,acpi-root-table`、`netbsd,smbios-table`、`netbsd,uefi-memmap`、UEFI system table/runtime関連プロパティがある。framebufferノードは次の値だった。
+
+| property | value |
+|---|---|
+| compatible | `simple-framebuffer` |
+| format | `a8b8g8r8` |
+| reg | `0x3e29a000 0x00960000` |
+| width / height | `1920 / 1280` |
+| stride | `0x1e00` (7680 bytes) |
+| status | `okay` |
+
+このFDTには `/soc`、HVS、PixelValve、HDMI、DDC、VEC、DPI、DSI、TXP等のBCM2711ハードウェアノードが存在しない。
+
+`model` がRaspberry Pi 4を示すことは、BCM2711の完全なDevice Treeが渡されたことを意味しない。`compatible = "netbsd,generic-acpi"` と `/acpi` ノードは、後述するNetBSD EFI bootloaderのACPI用合成FDTと一致する。
+
+したがって、この実機FDTから「BCM2711の表示ブロックがdisabled」と結論してはならない。表示ブロックの記述そのものがこのFDTに含まれていない。
+
+### 10.29.3 NetBSD EFI bootloaderのFDT取得
+
+調査対象は作業ブランチ `vc4-drmkms` の共通EFI bootloaderである。主要ファイルと確認したblob SHAは以下のとおり。
+
+| file | blob SHA | relevant role |
+|---|---|---|
+| `sys/stand/efiboot/efiboot.c` | `49e660d86d0bbebf5abe5b742c9e307bf44c5bf0` | EFI entry、ACPI/FDT probe |
+| `sys/stand/efiboot/boot.c` | `4edd17bcc2e07c6cc3861252dd06bb6413133909` | `acpi` / `dtb` / overlay boot commands |
+| `sys/stand/efiboot/efifdt.c` | `8fa6424eaa5f9b4d43c7ac583f76d0c7a58bbe91` | EFI FDT table取得、FDT選択・合成・引き渡し |
+| `sys/stand/efiboot/efiacpi.c` | `e3af1532980137214c50e53f3c1c5dd9f2f93517` | ACPI table検出と有効/無効状態 |
+| `sys/stand/efiboot/exec.c` | `4ec6e35207d9edffc16b5508ae9ebf2ef2f9b3b6` | kernel load後のFDT prepare呼び出し |
+| `sys/stand/efiboot/overlay.c` | `19f13928649394982749c32c620b0b5330dda13d` | EFI bootloader側overlayリスト |
+| `sys/stand/efiboot/Makefile.efiboot` | `e126c2635a5ee60498a30ac6c14353685b47354f` | EFIBOOT_FDT / EFIBOOT_ACPI build option |
+
+#### EFI entryでのprobe
+
+`efiboot.c:efi_main()` は、ビルド時に有効な場合、次の順序でprobeする。
+
+1. `efi_acpi_probe()`
+2. `efi_fdt_probe()`
+3. その他のEFI device probe
+4. `boot()`
+
+`efi_fdt_probe()` はEFI System TableのConfigurationTableから `FDT_TABLE_GUID` を検索する。GUIDは次の値である。
+
+```c
+{ 0xb1b621d5, 0xf19c, 0x41a5,
+  { 0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0 } }
+```
+
+取得処理は `LibGetSystemConfigurationTable()` を使用し、`fdt_check_header()` でDTB headerを検証する。成功時はEFI Configuration Tableが指すDTBを `fdt_data` に保持する。
+
+#### kernel起動時のFDT選択
+
+`exec.c:exec_netbsd()` はkernelをロードした後、`efi_fdt_prepare_boot()` を呼び出す。`efifdt.c` の処理順序は次のとおり。
+
+1. bootloaderの `dtb` 設定があれば、指定ファイルを `load_file()` で読み込む。
+2. machine-dependent boot preparationを実行する。
+3. ACPIが利用可能かつ有効で、kernelがlittle-endianの場合、`efi_fdt_create_acpifdt()` を呼ぶ。
+4. 上記ACPI経路に入らず、かつ `dtb` overrideがロードされている場合は `efi_fdt_set_data()` でoverride DTBを採用する。
+5. その後、選択されたFDTにoverlay、initrd、random seed、bootargs、UEFI情報、GOP framebuffer、EFI memory map等を追加する。
+6. `ExitBootServices()` を実行し、FDTをkernelへ渡す。
+
+重要なのは、選択条件が次の形になっている点である。
+
+```c
+#ifdef EFIBOOT_ACPI
+if (efi_acpi_available() && netbsd_elf_data == ELFDATA2LSB) {
+    error = efi_fdt_create_acpifdt();
+    if (error != 0)
+        return error;
+} else
+#endif
+if (dtb_addr && efi_fdt_set_data((void *)(uintptr_t)dtb_addr) != 0) {
+    return EINVAL;
+}
+```
+
+つまりACPIが有効な場合、EFI Configuration Tableから取得済みの元DTBや、bootloaderの `dtb` overrideより先に、ACPI用FDTを新規生成する。ACPI + Device TreeモードでEFI firmwareがACPI tableとDTB tableの両方を公開していたとしても、NetBSD EFI bootloaderはこの分岐により元のDTBをkernel向けFDTとして採用しない。
+
+#### ACPI用合成FDTの構造
+
+`efi_fdt_create_acpifdt()` は `fdt_create_empty_tree()` で空のFDTを生成し、次を設定する。
+
+- root `compatible = "netbsd,generic-acpi"`
+- root `model` はSMBIOSのSystem Informationから取得
+- root `#address-cells = 2`、`#size-cells = 2`
+- `/chosen/netbsd,acpi-root-table`
+- 存在する場合は `/chosen/netbsd,smbios-table`
+- `/acpi/compatible = "netbsd,acpi"`
+
+後続の `efi_fdt_memory_map()` がEFI memory mapを `/memory` と `/chosen/netbsd,uefi-memmap` に追加する。`efi_fdt_gop()` はGOPからsimple-framebufferノードを生成し、ACPIが有効な場合は `stdout-path` も設定する。
+
+これは実機の `ofctl -pv` で観測したroot compatible、model、`/acpi`、`/chosen` のUEFI情報、memory、framebufferと整合する。
+
+### 10.29.4 PFTF UEFI / EDK2側のDTB供給仕様
+
+PFTF RPi4 firmwareの説明、およびEDK2-platforms `Platform/RaspberryPi/RPi4` の説明では、VideoCore firmwareがロードしたDevice TreeをUEFIが使用する。Pi 4B用の標準ファイルは `bcm2711-rpi-4-b.dtb` である。boot media上の別DTBを指定する `device_tree=...` もサポートされ、`dtoverlay` / `dtparam` もサポート対象と説明されている。
+
+PFTF/EDK2文書が示すDTB領域設定は次のとおり。
+
+```ini
+disable_commandline_tags=2
+device_tree_address=0x3e0000
+device_tree_end=0x400000
+```
+
+今回の実機 `config.txt` は `device_tree_address` と `device_tree_end` は一致するが、`disable_commandline_tags=1` である。PFTF文書の推奨例は `2` なので、この差異は記録しておく。値の変更は別途Raspberry Pi firmwareの仕様と実機起動結果を確認してから行う。
+
+PFTFのSystem Table Selectionは次の値で定義される。
+
+| value | mode |
+|---:|---|
+| 0 | ACPI |
+| 1 | ACPI + Device Tree |
+| 2 | Device Tree |
+
+EDK2-platformsのRPi4設定ではSystemTableModeのビルド時defaultは0 (ACPI) であり、PFTFの公開READMEも配布firmwareはACPIをdefaultにすると説明している。またEDK2-platformsのRPi4 READMEは、Device Tree bootがOSによって動作しない場合があるため、初期設定ではDevice Tree提供を無効にしてACPI bootを強制すると明記している。
+
+PFTF RPi4 repositoryの現行submodule pointerはedk2-platforms commit `4db2845` を指していることを確認した。ただし、実機に置かれた `RPI_EFI.fd` のrelease/versionはまだ取得していないため、実機バイナリがその時点のsourceと完全一致するとは断定しない。
+
+#### UEFI Configuration TableのDTB契約
+
+UEFI SpecificationのEFI System Table / Devicetree Tables節では、DTBは `EFI_DTB_TABLE_GUID` によりEFI Configuration Tableに登録される。DTBは `EfiACPIReclaimMemory` に置かれ、UEFI application/driverが実行される前に登録されている必要がある。登録後、firmwareはそのDTBを変更・参照してはならず、UEFI applicationはDTBを変更または置換できる。
+
+NetBSD EFI bootloaderはこのConfiguration TableからDTBを取得し、必要なboot propertyを加えたFDTをkernelに渡す構造になっている。
+
+### 10.29.5 今回の実機結果から確定できること
+
+今回の観測とソースを組み合わせると、ACPI + Device Treeで起動したNetBSDが最小FDTを受け取った直接の理由は、PFTF firmwareがDTBを渡さなかったためと決めつけるべきではない。NetBSD EFI bootloaderの `efi_fdt_prepare_boot()` が、ACPI tableが有効な場合に元DTBを使わず、ACPI用合成FDTを生成することがソースから確認できた。
+
+したがって現時点の整理は次のとおり。
+
+- PFTFのVideoCore→UEFI DTB供給経路は公開仕様上存在する。
+- ACPI + Device Treeは両方のsystem tableを提供する設定である。
+- NetBSD EFI bootloaderはACPIが有効ならACPI用合成FDTを選択する。
+- 実機で観測した `netbsd,generic-acpi` FDTはこのNetBSD側分岐の結果と一致する。
+- したがって、今回の `ofctl` に `/soc` がないことは、VideoCore/UEFI段階でDTBが失われた証拠ではない。
+- DT-onlyモードで画面が消え、pingにも応答しなかった事象は、元DTBを使う別経路での起動失敗または表示・console handoffの問題を示唆するが、現時点ではkernel hangと断定できない。
+
+なお、`config.txt` の `dtoverlay=upstream-pi4` はVideoCore firmware段階で適用されるoverlayである。一方、NetBSD EFI bootloaderの `dtoverlay` / `dtoverlays` コマンドは `boot.cfg` 等で指定したoverlayを、EFI bootloaderが選択したFDTへ追加する別の仕組みである。両者を混同しない。
+
+### 10.29.6 次の実機検証手順
+
+次はUEFI設定を変更せず、ACPI + Device Treeを維持したまま、NetBSD EFI bootloaderのACPI選択だけを無効化して元DTBをkernelへ渡す比較試験を行う。
+
+1. boot promptで `help` を実行し、`acpi` commandが存在することを確認する。
+2. `acpi off` を実行する。
+3. `boot` でkernelを起動する。
+4. 起動後に `ofctl -p /` または `ofctl -pv` を取得する。
+5. root compatible/model、`/soc`、`gpu` / `hvs` / `pixelvalve` / `hdmi` / `ddc` の各ノードとstatusを確認する。
+6. 同時にdmesgを保存し、ACPI device attachとFDT device attachの差を比較する。
+
+この試験は、ACPI + DTのUEFI Configuration Tableに元DTBが存在し、NetBSD EFI bootloaderがprobeできている場合に限り、ACPI用合成FDTを回避して元DTBを使うことを狙う。もし `acpi off` 後もFDTがない場合は、次に `boot.cfg` の `dtb` commandで `/boot/bcm2711-rpi-4-b.dtb` を明示して比較する。ただしACPIが有効なままではソース上ACPI合成FDT分岐が優先されるため、先に `acpi off` が必要である。
+
+この試験でfull FDTが確認できれば、実機DTBの内容・overlay適用状態を確認したうえでVC5 master compatible、HVS、PixelValve、HDMIのattach調査へ戻る。DT-onlyでのblank screen問題は、serial consoleまたは別の確実なログ取得経路を用いて、kernel停止と表示handoff失敗を切り分ける。
+
+### 10.29.7 追加で固定すべき情報
+
+| item | current state | required capture |
+|---|---|---|
+| NetBSD kernel | 11.99.11 / aarch64 | exact kernel build/source revision |
+| EFI loader | `bootaa64.efi` | `version` output、build revision、FDT/ACPI build options |
+| PFTF UEFI | `RPI_EFI.fd` | UEFI version/build ID、release archive、SHA-256 |
+| VideoCore DTB | `bcm2711-rpi-4-b.dtb` | SHA-256 |
+| Overlay | `upstream-pi4.dtbo`, `miniuart-bt.dtbo` | SHA-256 and config.txt |
+| Runtime FDT | ACPI synthetic FDT captured | DT-only or `acpi off` FDT dump and SHA-256 |
+| boot.cfg | not captured | exact file and any `dtb` / `dtoverlay` commands |
+
+### 10.29.8 参照ソース
+
+- NetBSD EFI bootloader: [sys/stand/efiboot/efiboot.c](https://github.com/ebijun/src/blob/vc4-drmkms/sys/stand/efiboot/efiboot.c)
+- NetBSD EFI boot commands: [sys/stand/efiboot/boot.c](https://github.com/ebijun/src/blob/vc4-drmkms/sys/stand/efiboot/boot.c)
+- NetBSD EFI FDT handling: [sys/stand/efiboot/efifdt.c](https://github.com/ebijun/src/blob/vc4-drmkms/sys/stand/efiboot/efifdt.c)
+- NetBSD EFI ACPI handling: [sys/stand/efiboot/efiacpi.c](https://github.com/ebijun/src/blob/vc4-drmkms/sys/stand/efiboot/efiacpi.c)
+- PFTF RPi4 firmware README: [pftf/RPi4](https://github.com/pftf/RPi4)
+- EDK2 RPi4 platform README: [Platform/RaspberryPi/RPi4/Readme.md](https://github.com/tianocore/edk2-platforms/blob/master/Platform/RaspberryPi/RPi4/Readme.md)
+- EDK2 RPi4 platform configuration: [RPi4.dsc](https://github.com/tianocore/edk2-platforms/blob/master/Platform/RaspberryPi/RPi4/RPi4.dsc)
+- UEFI Specification, EFI System Table / Devicetree Tables: [UEFI Specification](https://github.com/UEFI/UEFI-Specification-Release/blob/main/source/04_EFI_System_Table.rst)
+
+今回の調査はドキュメント追記のみであり、kernel、EFI bootloader、PFTF firmware、config.txtは変更していない。GitHub Actions buildおよび追加の実機boot testも実行していない。
