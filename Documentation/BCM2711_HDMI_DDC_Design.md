@@ -3349,3 +3349,289 @@ FDT busのscan orderやattach passをcomponent bind順の代替に使わない�
 - HDMI connectorは `connector_fdt` と `dispcon_hdmi` の同compatible attach候補がある。VC4 HDMI componentの内部connector生成とのownershipを統一する必要がある。
 - genfb/simplefbはVC4 MMIOとは別resourceだが、KMS takeover時のconsole/framebuffer handoffが必要である。
 - 以上から、VEC/DPI/DSI/TXPのソースを取り込む前に、CFATTACH/configとresource ownershipの方針を確定した。実際のC source import、CFATTACH追加、DTB range検査、buildはまだ行っていない。
+
+
+### 10.25 対象DTB固定からconsole handoffまでの8段階調査（Raspberry Pi 4 Model B）
+
+本節では、10.23/10.24節のVC4 v5.6移植設計を実際のBCM2711 board DTBと照合し、指定された8段階を順に調査した。重要な結論として、**Raspberry Pi 4 Model Bの表示系はこのbranchがimportしたLinux v5.6 VC4 driverのcompatible/世代と一致しない**。従って、8つのVC4 subdriverをそのままCFATTACH化する前に、対象がVC5であることを前提に移植対象を再定義しなければならない。
+
+#### 10.25.1 Step 1 — 対象Raspberry PiとDTB sourceを固定
+
+この調査のbaselineを **Raspberry Pi 4 Model B (BCM2711)** とする。理由はbranchに専用のNetBSD DTS wrapperがあり、直近の設計文書もBCM2711 HDMIを対象にしているためである。別のRaspberry Pi modelを実機対象としている場合は、この節のDTB/resource表をそのmodelのDTSで再作成する。
+
+DT source include chain:
+
+```text
+sys/arch/arm/dts/bcm2711-rpi-4-b.dts
+  -> sys/external/gpl2/dts/dist/arch/arm64/boot/dts/broadcom/
+       bcm2711-rpi-4-b.dts
+       -> arm/broadcom/bcm2711-rpi-4-b.dts
+          -> sys/external/gpl2/dts/dist/arch/arm/boot/dts/broadcom/
+               bcm2711-rpi-4-b.dts
+               -> bcm2711.dtsi
+               -> bcm2711-rpi.dtsi
+                  -> bcm2835-rpi.dtsi
+               -> bcm283x-rpi-led-deprecated.dtsi
+               -> bcm283x-rpi-usb-peripheral.dtsi
+               -> bcm283x-rpi-wifi-bt.dtsi
+```
+
+確認したsource identity:
+
+| source | Git blob SHA |
+|---|---|
+| NetBSD wrapper `sys/arch/arm/dts/bcm2711-rpi-4-b.dts` | `9ea6b5897ed8170de02bdf655b8deb7a2ceaf9c9` |
+| arm64 wrapper `.../arch/arm64/boot/dts/broadcom/bcm2711-rpi-4-b.dts` | `c7280bdefa8d6c685438c13e8e3d17cfc9be0a19` |
+| board DTS `.../arch/arm/boot/dts/broadcom/bcm2711-rpi-4-b.dts` | `353bb50ce5425c9763f1a1f9d067bf1055ce4bb2` |
+| SoC DTSI `.../arch/arm/boot/dts/broadcom/bcm2711.dtsi` | `c06d9f5e53c8049478f4fd1564b64fcf11ee8368` |
+| common peripheral DTSI `.../arch/arm/boot/dts/broadcom/bcm283x.dtsi` | `69b0919f1324abd5d875c70936de1b7f22e3e66d` |
+| RPi board common DTSI `.../arch/arm/boot/dts/broadcom/bcm2711-rpi.dtsi` | `c78ed064d1667d0d20f00cdd84b0af05d385bac0` |
+
+The board DTS root has `compatible = "raspberrypi,4-model-b", "brcm,bcm2711"`. The board file enables HDMI0/HDMI1 and PixelValve0/1/2/4, disables VEC, and enables the VC5 GPU node. The DT source has been fixed for this investigation, but this work did not compile a .dtb or capture the firmware-modified runtime FDT. Those are still required before claiming the exact boot-time tree is fixed.
+
+**Generation mismatch (blocking):**
+
+- `bcm2711.dtsi` declares `vc4: gpu` with `compatible = "brcm,bcm2711-vc5"`.
+- The RPi4 board DTS sets `&vc4 { status = "okay"; }`.
+- Current NetBSD `sys/external/bsd/drm2/vc4/vc4_fdt.c` matches `brcm,bcm2835-vc4`, `brcm,bcm2837-vc4`, and `brcm,bcm2711-vc4`; it does **not** match `brcm,bcm2711-vc5`.
+- Imported Linux v5.6 VC4 subdrivers expect BCM2835-family compatibles such as `brcm,bcm2835-hdmi`, `brcm,bcm2835-hvs`, `brcm,bcm2835-pixelvalve0`, and `brcm,bcm2835-v3d`. RPi4 uses BCM2711/VC5 compatibles for these blocks.
+
+Therefore, the RPi4 master does not currently attach through `vc4_fdt.c`, and the v5.6 VC4 component list is not a valid description of the RPi4 hardware. Do not solve this by merely adding `brcm,bcm2711-vc5` to the existing VC4 match table; VC5 hardware/driver support is a separate porting task.
+
+#### 10.25.2 Step 2 — RPi4 VC5 blocks: reg ranges, IRQs, enabled state
+
+The `soc` node in `bcm2711.dtsi` translates the peripheral child address ranges as follows:
+
+```dts
+ranges = <0x7e000000 0x0 0xfe000000 0x01800000>,
+         <0x7c000000 0x0 0xfc000000 0x02000000>;
+```
+
+For the peripheral addresses listed below, the resulting CPU physical address is the child address plus `0x80000000`. Ranges below are inclusive start/end addresses. IRQ numbers are GIC SPI numbers unless explicitly marked as AON interrupt-controller inputs.
+
+| block / DT node | compatible in RPi4 tree | DT reg (child address / size) | translated physical range | IRQ | RPi4 status |
+|---|---|---|---|---|---|
+| TXP | `brcm,bcm2835-txp` | `0x7e004000 / 0x20` | `0xfe004000-0xfe00401f` | SPI 75 | enabled by default |
+| CPRMAN | `brcm,bcm2711-cprman` | `0x7e101000 / 0x2000` | `0xfe101000-0xfe102fff` | — | enabled |
+| PixelValve0 | `brcm,bcm2711-pixelvalve0` | `0x7e206000 / 0x100` | `0xfe206000-0xfe2060ff` | SPI 109 | enabled |
+| PixelValve1 | `brcm,bcm2711-pixelvalve1` | `0x7e207000 / 0x100` | `0xfe207000-0xfe2070ff` | SPI 110 | enabled |
+| DPI | `brcm,bcm2835-dpi` | `0x7e208000 / 0x8c` | `0xfe208000-0xfe20808b` | — | disabled |
+| DSI0 | `brcm,bcm2835-dsi0` | `0x7e209000 / 0x78` | `0xfe209000-0xfe209077` | SPI 100 | disabled |
+| PixelValve2 | `brcm,bcm2711-pixelvalve2` | `0x7e20a000 / 0x100` | `0xfe20a000-0xfe20a0ff` | SPI 101 | enabled |
+| PixelValve4 | `brcm,bcm2711-pixelvalve4` | `0x7e216000 / 0x100` | `0xfe216000-0xfe2160ff` | SPI 110 | enabled |
+| HVS | `brcm,bcm2711-hvs` | `0x7e400000 / 0x8000` | `0xfe400000-0xfe407fff` | SPI 97 | enabled |
+| DSI1 | `brcm,bcm2711-dsi1` | `0x7e700000 / 0x8c` | `0xfe700000-0xfe70008b` | SPI 108 | disabled |
+| PixelValve3 | `brcm,bcm2711-pixelvalve3` | `0x7ec12000 / 0x100` | `0xfec12000-0xfec120ff` | SPI 106 | disabled |
+| VEC | `brcm,bcm2711-vec` | `0x7ec13000 / 0x1000` | `0xfec13000-0xfec13fff` | SPI 123 | disabled |
+| V3D hub | `brcm,2711-v3d` | `0x7ec00000 / 0x4000` | `0xfec00000-0xfec03fff` | SPI 74 | enabled |
+| V3D core0 | `brcm,2711-v3d` | `0x7ec04000 / 0x4000` | `0xfec04000-0xfec07fff` | shared V3D node | enabled |
+
+HDMI has multiple named reg resources and uses an AON interrupt controller rather than direct GIC interrupt specifiers.
+
+| HDMI node | named reg resource | translated physical range |
+|---|---|---|
+| HDMI0 | hdmi | `0xfef00700-0xfef009ff` |
+| HDMI0 | dvp | `0xfef00300-0xfef004ff` |
+| HDMI0 | phy | `0xfef00f00-0xfef00f7f` |
+| HDMI0 | rm | `0xfef00f80-0xfef00fff` |
+| HDMI0 | packet | `0xfef01b00-0xfef01cff` |
+| HDMI0 | metadata | `0xfef01f00-0xfef022ff` |
+| HDMI0 | csc | `0xfef00200-0xfef0027f` |
+| HDMI0 | cec | `0xfef04300-0xfef043ff` |
+| HDMI0 | hd | `0xfef20000-0xfef200ff` |
+| HDMI1 | hdmi | `0xfef05700-0xfef059ff` |
+| HDMI1 | dvp | `0xfef05300-0xfef054ff` |
+| HDMI1 | phy | `0xfef05f00-0xfef05f7f` |
+| HDMI1 | rm | `0xfef05f80-0xfef05fff` |
+| HDMI1 | packet | `0xfef06b00-0xfef06cff` |
+| HDMI1 | metadata | `0xfef06f00-0xfef072ff` |
+| HDMI1 | csc | `0xfef00280-0xfef002ff` |
+| HDMI1 | cec | `0xfef09300-0xfef093ff` |
+| HDMI1 | hd | `0xfef20000-0xfef200ff` |
+
+Both HDMI nodes refer to the exact same `hd` range `0xfef20000-0xfef200ff`. This is a real shared range in the source DTS and must be treated as shared hardware state: do not let two independent subdrivers assume exclusive ownership. Use one common owner or a shared-resource object with explicit lifetime/locking.
+
+HDMI interrupts:
+
+- HDMI0 has AON input indices 0..5: `cec-tx`, `cec-rx`, `cec-low`, `wakeup`, `hpd-connected`, `hpd-removed`.
+- HDMI1 has AON input indices 8, 7, 6, 9, 10, 11 with the same names.
+- The AON interrupt controller itself is connected to GIC SPI 96.
+
+The DDC controllers are separate FDT nodes:
+
+| node | compatible | reg ranges (physical) | status |
+|---|---|---|---|
+| DDC0 | `brcm,bcm2711-hdmi-i2c` | `0xfef04500-0xfef045ff`, `0xfef00b00-0xfef00dff` | enabled |
+| DDC1 | `brcm,bcm2711-hdmi-i2c` | `0xfef09500-0xfef095ff`, `0xfef05b00-0xfef05dff` | enabled |
+
+Important compatibility facts for the RPi4 baseline:
+
+- TXP retains the BCM2835 compatible and is the only listed VC4-era display component whose compatible directly matches the v5.6 TXP driver.
+- HVS, PixelValve, VEC, HDMI and V3D use BCM2711-specific compatible strings; the v5.6 VC4 subdrivers do not match them.
+- DPI is BCM2835-compatible but disabled.
+- DSI0 is disabled; DSI1 is disabled and its compatible is changed to `brcm,bcm2711-dsi1`.
+- VEC and PixelValve3 are disabled.
+- PixelValve4 is enabled but has no corresponding v5.6 PixelValve compatible/implementation.
+- HDMI0/1 are enabled and are not `brcm,bcm2835-hdmi`.
+
+This table is a source-DTS translation, not a runtime resource reservation test. After bootloader fixups, inspect the actual DTB passed to NetBSD and run overlap checks against every enabled reg range. The shared HDMI `hd` range is already visible at source level and must be explicitly handled.
+
+#### 10.25.3 Step 3 — CPRMAN and Raspberry Pi firmware clock providers
+
+Current NetBSD `sys/arch/arm/broadcom/bcm2835_cprman.c`:
+
+- Declares IDs through `CPRMAN_CLOCK_EMMC2` (ID 51), including V3D=21, VEC=24, HSM=25, DPI=44, DSI0E=47, DSI1E=48, DSI0P=49, DSI1P=50.
+- Actually calls `cprman_add_clock()` only for `uart`, `vpu`, `emmc`, and `emmc2`.
+- `cprman_decode()` rejects IDs whose clock name is not registered.
+- `cprman_get_rate()` handles only UART, VPU, EMMC, EMMC2 and panics for other IDs.
+- The `clk_funcs` implementation does not currently provide a complete BCM2711 clock programming implementation.
+
+RPi4 adds a second, separate clock path. `bcm2835-rpi.dtsi` declares `raspberrypi,firmware-clocks`, and `bcm2711-rpi.dtsi` assigns:
+
+- HDMI0/1 clocks: firmware clock IDs 13 and 14, DVP outputs 0/1, fixed 27 MHz CEC clock.
+- HVS: firmware clock ID 4.
+- V3D: firmware clock ID 5.
+- DSI0/DSI1 and DPI definitions inherit BCM283x CPRMAN clock references, but those display nodes are disabled in the RPi4 board DTS.
+
+No NetBSD driver matching `raspberrypi,firmware-clocks` was found in the current branch. Extending CPRMAN alone cannot satisfy HDMI/HVS/V3D clock consumers because those consumers reference the firmware clock provider, not the CPRMAN provider.
+
+**Step 3 design decision:**
+
+1. Add a separate NetBSD FDT clock provider for `raspberrypi,firmware-clocks`, using the existing Raspberry Pi firmware/mailbox service path. It must decode the firmware clock IDs and implement get/set rate and enable/disable semantics supported by the firmware protocol.
+2. Extend `bcm2835_cprman.c` separately for any enabled consumer that references `&clocks`: implement clock IDs, names, rate calculation, enable/disable and parent/rate behavior required by the consumer. Do not add names without implementing the corresponding operations.
+3. Do not let a VC4/VC5 subdriver directly manipulate CPRMAN registers when the FDT describes a clock provider.
+4. Verify the provider using the actual RPi4 clock phandles before importing HDMI/HVS/V3D code.
+
+The exact firmware clock API implementation and CPRMAN register programming are not part of this documentation-only change.
+
+#### 10.25.4 Step 4 — HDMI connector/DDC/HPD ownership decision for RPi4
+
+RPi4 has two hardware nodes `brcm,bcm2711-hdmi0` and `brcm,bcm2711-hdmi1`, each with its own `ddc` phandle and named interrupt set. The board DTS enables both HDMI nodes and both `brcm,bcm2711-hdmi-i2c` DDC nodes. The base board DTS does not declare separate `hdmi-connector` nodes.
+
+Current NetBSD integration mismatch:
+
+- `sys/dev/fdt/hdmi_connector.c` matches generic `hdmi-connector`, creates a DRM connector endpoint, and reads `hpd-gpios`.
+- The RPi4 HDMI nodes use HPD interrupt events and a `ddc = <&ddc0/ddc1>` phandle, not the generic connector node's `hpd-gpios` model.
+- `sys/arch/arm/broadcom/bcm2835_bsc_fdt.c` matches only `brcm,bcm2835-i2c`; it does not match `brcm,bcm2711-hdmi-i2c`.
+- Therefore the existing BSC driver cannot be assumed to provide RPi4 HDMI DDC.
+
+**Decision for the RPi4 baseline:** the BCM2711 HDMI hardware driver owns its DRM encoder and connector, consumes the matching DDC adapter via the HDMI node's `ddc` phandle, and translates the HDMI HPD interrupt events into connector hotplug state. A dedicated `brcm,bcm2711-hdmi-i2c` driver must register the DDC I2C adapter. Do not attach generic `dispcon_hdmi` to the same physical HDMI output in this model.
+
+If a future board DTB explicitly supplies an `hdmi-connector` graph endpoint and the hardware driver is changed to expose only an encoder endpoint, ownership may be split; in that design the HDMI hardware driver must not create a second connector or independently own the generic connector's HPD GPIO. This alternative is not the RPi4 base-DTS design.
+
+The shared HDMI `hd` register range described in 10.25.2 must be owned by a common HDMI resource layer or a single HDMI instance, not mapped as two exclusive per-port resources.
+
+#### 10.25.5 Step 5 — DPI/DSI panel and bridge graph
+
+The RPi4 base DTS inherits these BCM283x nodes:
+
+- DPI: `brcm,bcm2835-dpi`, reg `0x7e208000/0x8c`, clocks `core` and `pixel`, but `status = "disabled"`.
+- DSI0: `brcm,bcm2835-dsi0`, reg `0x7e209000/0x78`, IRQ GIC SPI 100, but `status = "disabled"`.
+- DSI1: compatible overridden to `brcm,bcm2711-dsi1`, reg `0x7e700000/0x8c`, IRQ GIC SPI 108, but remains `status = "disabled"`.
+
+The RPi4 board DTS does not enable DPI/DSI and does not add a panel endpoint for these blocks. Thus DPI/DSI are not part of the baseline RPi4 display pipeline being brought up. The v5.6 VC4 DSI driver also does not match the BCM2711 DSI1 compatible.
+
+NetBSD already has generic DRM panel/FDT endpoint support in `sys/dev/fdt/fdt_panel.c` and panel-related definitions in `sys/dev/fdt/files.fdt`. This does not provide the missing BCM2711 DSI host driver, DSI bus registration, or a panel/bridge graph that is absent from the base board DTS.
+
+**Decision:** defer DPI/DSI panel/bridge integration for the RPi4 baseline. If a later board overlay enables either interface, require all of the following before enabling the subdriver:
+
+1. Confirm the resulting runtime DTB has `status = "okay"` on the controller and a complete `ports/endpoint/remote-endpoint` graph.
+2. Match the actual BCM2711 compatible, not the v5.6 BCM2835 compatible.
+3. Register the MIPI-DSI host before panel probe can depend on it.
+4. Keep DRM encoder/bridge binding in the master bind phase.
+5. Use the existing NetBSD panel/bridge endpoint objects rather than creating duplicate panel objects in the controller driver.
+
+#### 10.25.6 Step 6 — files.bcm2835 CFATTACH/config additions
+
+Current `sys/arch/arm/broadcom/files.bcm2835` contains only the VC4 master entry:
+
+```make
+device  vc4drm: drmkms
+attach  vc4drm at fdt with vc4_fdt
+file    external/bsd/drm2/vc4/vc4_fdt.c vc4drm
+```
+
+There are no separate entries for HDMI, VEC, DPI, DSI, TXP, HVS, PixelValve/CRTC or V3D. More importantly, the current master match table is not compatible with the RPi4 `brcm,bcm2711-vc5` node.
+
+**Decision:** do not add the eight Linux v5.6 VC4 subdrivers to `files.bcm2835` as RPi4 drivers. First establish whether the target is:
+
+- BCM2835/BCM2837 VC4: keep a VC4-specific master and add CFATTACH/config only for compatible blocks actually present/enabled in that board DTB; or
+- BCM2711 RPi4 VC5: create a separately identified VC5 driver set based on the BCM2711 compatible tables and hardware implementation.
+
+For the selected RPi4 baseline, the next config work is therefore not a blind list of `vc4_vec`, `vc4_dpi`, `vc4_dsi`, etc. It is a VC5-compatible inventory, including the two HDMI instances, BCM2711 HVS, BCM2711 PixelValve0/1/2/4, BCM2711 V3D, TXP, and the HDMI DDC adapters. The current `vc4drm` name/source should not silently claim VC5 support.
+
+No `files.bcm2835` or C source was changed in this task.
+
+#### 10.25.7 Step 7 — component registry and master bind
+
+The RPi4 DTS layout reinforces the earlier device_t parentage finding:
+
+- The `gpu` master node is at the root of the device tree.
+- HDMI, HVS, PixelValve, TXP, DSI, DPI, VEC and DDC nodes are under the `soc` simple-bus.
+- FDT bus attachment follows the nearest simplebus device_t, not the logical GPU/master relationship.
+
+Therefore, a registry must not rely on `device_t` parent/child traversal. It should use the master OF node identity and each component OF node identity, with a verified rule that associates the component node with the correct GPU/master instance. It must support multiple HDMI instances and multiple PixelValve instances.
+
+However, the component type list and bind order in 10.23 are specifically the Linux v5.6 VC4 implementation. They cannot be copied as the RPi4 master bind list because RPi4 uses VC5 compatibles and a different display block generation. Before implementing registry/bind:
+
+1. Select/import the correct BCM2711 VC5 driver architecture and identify its master/component model.
+2. Define per-instance component types (HDMI0/1, PixelValve channels, HVS, TXP, V3D, and optional interfaces).
+3. Define mandatory vs optional components from the RPi4 runtime DTB.
+4. Bind hardware providers before consumers; in particular clocks, DDC I2C, panel/bridge, and interrupt dependencies must be available before the corresponding DRM objects are initialized.
+5. Record successful binds and rollback strictly in reverse order.
+6. Ensure a component detach cannot free resources while the DRM master still references its encoder/connector/CRTC.
+
+The NetBSD implementation should be a native coordinator integrated with FDT/autoconfiguration, not no-op Linux `component_add()` stubs. The existing component framework findings in 10.21 remain valid as a statement about the current Linux-KPI shim, but the VC4 v5.6 list is not the RPi4 VC5 component inventory.
+
+#### 10.25.8 Step 8 — genfb/simplefb to DRM KMS console handoff
+
+Current NetBSD framebuffer matches:
+
+- `bcm2835_genfb.c` matches `brcm,bcm2835-fb`.
+- `sys/dev/fdt/simplefb.c` matches `simple-framebuffer`.
+- Both create a `genfb` console using framebuffer properties and a mapped framebuffer memory range.
+
+The RPi4 base DTS include chain does not include `bcm2835-common.dtsi`, where the BCM2835 `brcm,bcm2835-fb` node is defined. The RPi4 base DTS also does not declare a `simple-framebuffer` node. Consequently, neither existing FDT match is guaranteed to attach from the checked-in RPi4 base DTS.
+
+The Raspberry Pi boot firmware may modify the DTB or provide framebuffer information at boot. This investigation did not inspect the firmware-modified DTB, nor establish which device currently owns the wsdisplay console on the target machine. Do not assume that `bcmgenfb` or `simplefb` is active merely because the driver is compiled into the kernel.
+
+**Decision:** before implementing KMS console takeover:
+
+1. Capture/dump the exact DTB passed by firmware to NetBSD and check for `brcm,bcm2835-fb`, `simple-framebuffer`, framebuffer memory reservation, width/height/stride/format and status.
+2. Confirm which NetBSD genfb/console device actually attaches and owns the active wsdisplay console.
+3. Define the lifetime and ownership of the firmware framebuffer memory; do not free/reuse it while the console or any mmap still references it.
+4. Bring up VC5 KMS without destroying the old console, then switch the display/console only after a valid DRM framebuffer and scanout mode are active.
+5. Define rollback to the firmware framebuffer if KMS initialization or mode setting fails.
+6. Only after successful handoff, disable old genfb polling/update paths and release resources that are proven no longer in use.
+
+The current `bcm2835_genfb.c` has a static console device pointer and a global ioctl callback hook; `simplefb.c` has its own FDT console match and console phandle. These are not a generic DRM takeover API. A dedicated handoff interface or a carefully scoped extension is required; do not simply detach genfb during VC4/VC5 probe.
+
+#### 10.25.9 Eight-step result/status table
+
+| Step | Result | Status / decision |
+|---|---|---|
+| 1. Fix target DTB | Raspberry Pi 4 Model B source chain identified; runtime firmware DTB not captured | Source baseline fixed; runtime validation pending |
+| 2. Check all reg/IRQ | RPi4 VC5 block ranges, translated addresses, IRQs and enabled states listed above | Source-level audit complete; runtime DTB and overlap tool check pending |
+| 3. Extend CPRMAN | CPRMAN registers only four clocks; RPi4 HDMI/HVS/V3D use separate firmware clock provider | Firmware clock provider missing; CPRMAN and firmware clock work required |
+| 4. HDMI ownership | RPi4 has HDMI0/1 + dedicated DDC nodes, no generic hdmi-connector in base DTS | HDMI hardware driver owns encoder/connector; DDC adapter is separate; do not double attach dispcon |
+| 5. DPI/DSI panel graph | DPI/DSI0/DSI1 disabled and no board panel graph in baseline | Defer until overlay/runtime DTB enables them |
+| 6. CFATTACH/config | Existing files.bcm2835 has master only; current master match does not match VC5 | Do not add v5.6 VC4 subdrivers for RPi4; define VC5 set first |
+| 7. Component registry/bind | Master root node and components under soc simplebus | OF-node registry needed; VC5 inventory/order must be defined first |
+| 8. genfb handoff | Base RPi4 DTS has neither bcm2835-fb nor simple-framebuffer | Inspect runtime FDT/console owner before designing takeover |
+
+#### 10.25.10 Overall conclusion and correction to earlier VC4 plan
+
+The eight-step investigation changes the implementation direction for the selected RPi4 Model B target:
+
+1. The selected board is BCM2711 RPi4 Model B, whose GPU node is `brcm,bcm2711-vc5`, not `brcm,bcm2711-vc4`.
+2. RPi4 display hardware uses BCM2711 HDMI0/1, HVS, PixelValve and V3D compatible strings. Linux v5.6 VC4 subdrivers are not a complete or correct match for this hardware.
+3. RPi4 HDMI uses dedicated `brcm,bcm2711-hdmi-i2c` DDC controller nodes; the existing `bsciic_fdt` is not their driver.
+4. RPi4 HDMI/HVS/V3D clocks are supplied through Raspberry Pi firmware clocks; the current branch has no `raspberrypi,firmware-clocks` provider.
+5. DPI/DSI/VEC are disabled in the checked-in RPi4 base DTS; they must not be treated as required components in the initial RPi4 display bring-up.
+6. The HDMI0/HDMI1 nodes share the same `hd` register range. Resource ownership must explicitly handle this shared block.
+7. The previous 10.23 Linux v5.6 VC4 bind order remains useful only for BCM2835-family VC4 targets. It is not the RPi4 VC5 bind order.
+8. The RPi4 base DTS does not declare a framebuffer node matched by current `bcmgenfb` or `simplefb`; the firmware-modified runtime FDT and actual console owner must be checked before implementing handoff.
+
+Accordingly, **do not proceed to importing the four missing v5.6 VC4 source files or adding eight VC4 CFATTACH entries for RPi4**. The next correct milestone is to choose the hardware target definitively (RPi4/VC5 versus an earlier BCM2835/BCM2837/VC4 board), then establish the matching upstream driver generation. For RPi4, investigate/import the BCM2711 VC5-capable driver architecture, implement firmware clocks and HDMI DDC support, and only then define its component registry and KMS handoff.
+
+This section records source-DTS analysis and design decisions. No compiled DTB, runtime FDT dump, resource reservation test, clock provider implementation, HDMI DDC driver, CFATTACH/config entry, component registry, or console handoff code was created or built in this task.
