@@ -7,8 +7,10 @@ on:
     branches: [ main ]
 
 jobs:
-  build-kernel:
+  build-earmv7hf:
+    name: earmv7hf / GENERIC
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
@@ -24,22 +26,35 @@ jobs:
           ./build.sh -U -j4 -m evbarm -a earmv7hf -O ./obj -T ./tools tools
           ./build.sh -U -j4 -m evbarm -a earmv7hf -O ./obj -T ./tools kernel=GENERIC
 
+      - name: Upload Kernel Artifact (earmv7hf)
+        uses: actions/upload-artifact@v4
+        with:
+          name: netbsd-kernel-earmv7hf-GENERIC
+          path: obj/sys/arch/evbarm/compile/GENERIC/netbsd
+          if-no-files-found: error
 
-      - name: Build Tools and Kernel (aarch64)
+  build-aarch64:
+    name: aarch64 / GENERIC64
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential zlib1g-dev libssl-dev git u-boot-tools
+
+      - name: Build Tools and Kernel (aarch64 GENERIC64)
         run: |
           ./build.sh -U -j4 -m evbarm -a aarch64 -O ./obj-aarch64 -T ./tools-aarch64 tools
           ./build.sh -U -j4 -m evbarm -a aarch64 -O ./obj-aarch64 -T ./tools-aarch64 kernel=GENERIC64
 
-      - name: Upload Kernel Artifact (aarch64)
+      - name: Upload Kernel Artifact (aarch64 GENERIC64)
         uses: actions/upload-artifact@v4
         with:
           name: netbsd-kernel-aarch64-GENERIC64
           path: obj-aarch64/sys/arch/evbarm/compile/GENERIC64/netbsd
-
-      - name: Upload Kernel Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: netbsd-kernel-earmv7hf
-          path: obj/sys/arch/evbarm/compile/GENERIC/netbsd
-
-
+          if-no-files-found: error
