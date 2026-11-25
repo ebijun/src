@@ -24,6 +24,18 @@ jobs:
           ./build.sh -U -j4 -m evbarm -a earmv7hf -O ./obj -T ./tools tools
           ./build.sh -U -j4 -m evbarm -a earmv7hf -O ./obj -T ./tools kernel=GENERIC
 
+
+      - name: Build Tools and Kernel (aarch64)
+        run: |
+          ./build.sh -U -j4 -m evbarm -a aarch64 -O ./obj-aarch64 -T ./tools-aarch64 tools
+          ./build.sh -U -j4 -m evbarm -a aarch64 -O ./obj-aarch64 -T ./tools-aarch64 kernel=GENERIC64
+
+      - name: Upload Kernel Artifact (aarch64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: netbsd-kernel-aarch64-GENERIC64
+          path: obj-aarch64/sys/arch/evbarm/compile/GENERIC64/netbsd
+
       - name: Upload Kernel Artifact
         uses: actions/upload-artifact@v4
         with:
