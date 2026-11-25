@@ -4897,3 +4897,51 @@ attach表示が出た後に `configuration failed`、register mapping error、li
 - [bcm2838_pcie.c](https://github.com/ebijun/src/blob/vc4-drmkms/sys/arch/arm/broadcom/bcm2838_pcie.c)
 - [bcm2711.dtsi](https://github.com/ebijun/src/blob/vc4-drmkms/sys/external/gpl2/dts/dist/arch/arm/boot/dts/broadcom/bcm2711.dtsi)
 - [bcm2711-rpi-4-b.dts](https://github.com/ebijun/src/blob/vc4-drmkms/sys/external/gpl2/dts/dist/arch/arm/boot/dts/broadcom/bcm2711-rpi-4-b.dts)
+
+## 10.32 GENERIC64 BCM2711 PCIe attachmentとCI検証（2026-11-26）
+
+### 10.32.1 kernel configuration変更
+
+標準 sys/arch/evbarm/conf/GENERIC64 のPCIE sectionへ、次のFDT attachmentを追加した。
+
+```
+bcm2838pcie* at fdt?                 # Broadcom BCM2711 PCIe host
+```
+
+files.generic64 は arch/arm/broadcom/files.bcm2835 をincludeし、同ファイルには device bcm2838pcie: pcibus、attach bcm2838pcie at fdt with bcm2838pcie_fdt、および bcm2838_pcie.c のfile宣言が存在する。この変更は既存CFATTACHをGENERIC64構成へ組み込むもので、driver本体の変更ではない。
+
+### 10.32.2 CIのaarch64対象追加
+
+既存 .github/workflows/kernel-build.yml は earmv7hf / GENERIC のクロスビルドのみで、Raspberry Pi 4で使用する evbarm / aarch64 / GENERIC64 を検証していなかった。
+
+そのため、同workflowに以下を追加した。
+
+```sh
+./build.sh -U -j4 -m evbarm -a aarch64 -O ./obj-aarch64 -T ./tools-aarch64 tools
+./build.sh -U -j4 -m evbarm -a aarch64 -O ./obj-aarch64 -T ./tools-aarch64 kernel=GENERIC64
+```
+
+生成kernelは netbsd-kernel-aarch64-GENERIC64 artifactとして分離する。従来のearmv7hfビルドは維持する。
+
+### 10.32.3 変更コミット
+
+- GENERIC64: 5c56f6ed5e48808dbc55c297564109caef3e6c75
+- aarch64 CI workflow: ffbb72ed4242a91a4b69763f424e70917fd04425
+
+workflow変更後のpushにより新しいCI runが開始されることを確認する。先行するGENERIC64変更コミットのrunはworkflow更新前の定義を使う可能性があるため、aarch64 jobの実行有無をrun/job一覧で必ず確認する。
+
+### 10.32.4 検証の判定基準と未完了項目
+
+CIで確認するのはGENERIC64のconfig生成、tools構築、kernel cross compileまでである。CI成功は実機PCIe link-up、VL805列挙、xHCI attachを保証しない。
+
+ビルド成功後、生成kernelをDTB起動で実機検証し、次を確認する。
+
+1. /scb/pcie@7d500000 が not configured ではなく bcm2838pcie0 としてattachする。
+2. RootBridge Revision とPCIe link-upが表示される。
+3. PCI busにVL805が列挙される。
+4. xHCIおよびUSB root hubがattachする。
+5. USB HID keyboardが ukbd / wskbd までattachする。
+
+DTB起動ではUSB keyboardを失う可能性があるため、実機検証はシリアルコンソール等の代替入力・出力経路を確保して行う。
+
+本節記載時点では、aarch64 CI workflowを更新したが、その更新後定義によるGENERIC64 build結果は未確認である。
