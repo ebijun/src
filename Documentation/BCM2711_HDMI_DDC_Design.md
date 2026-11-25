@@ -3807,3 +3807,325 @@ The following are the upstream source locations used for this investigation. For
 #### 10.26.9 Status
 
 This is a source comparison and porting design update only. No Linux source was imported, no NetBSD C code or `files.drmkms` / `files.bcm2835` was changed, no DTB was rebuilt, and no GitHub Actions build or hardware test was run.
+
+
+### 10.27 BCM2711 VC5移植のupstream基準固定と実装分割
+
+調査日: 2026-11-25。NetBSD branch `vc4-drmkms` の現行ファイルとLinux upstream release tag `v6.0` を比較した。今回の節では、依頼された9項目を実装可能な単位に分割し、ソース基準・依存API・NetBSD側の不足・実装順・完了条件を固定する。
+
+本節は設計・調査記録であり、Cソース、`files.bcm2835`、`files.drmkms` の変更やビルドは実施していない。
+
+#### 10.27.1 upstreamソース基準をLinux v6.0に固定する
+
+**VC5表示パイプライン移植の基準はLinux upstream tag `v6.0` とする。**
+
+理由:
+
+- v5.6にはBCM2711 VC5 master/HVS/PixelValve/HDMI対応が揃っていない。
+- v5.10にはBCM2711表示パイプラインの初期対応があるが、`vc5_drm_driver` と `vc4_drm_driver` を分けるdescriptorはまだない。
+- v6.0では `brcm,bcm2711-vc5` のmatch、VC5専用DRM descriptor、BCM2711 HVS/PV/HDMI variant、firmware clock、DVP clock/reset、HDMI DDC I2C、独立V3D driverを同じrelease基準で確認できる。
+- v6.0のVC5 generation表現は `bool is_vc5`。後年のVC6対応に伴う `enum vc4_gen` 導入はv6.0には含まれない。RPi4だけを対象とする段階で後年のVC6対応まで取り込まない。
+
+基準ファイルとv6.0 tag上のblob SHA:
+
+| Linux v6.0 path | blob SHA | 用途 |
+|---|---|---|
+| `drivers/gpu/drm/vc4/vc4_drv.c` | `292d1b6a01b6fcb54f453ca18c0efbb2f3773ec7` | master、VC4/VC5 DRM descriptor、component orchestration |
+| `drivers/gpu/drm/vc4/vc4_hvs.c` | `fbaa741dda5f98badb605439956a783de8b35058` | HVS5 |
+| `drivers/gpu/drm/vc4/vc4_crtc.c` | `029be98660b3043d794d582202f9711bb62b1b13` | BCM2711 PixelValve0..4 |
+| `drivers/gpu/drm/vc4/vc4_hdmi.c` | `1e5f68704d7d8b73a3d16f70d0bfe300243b26ac` | HDMI0/1 |
+| `drivers/gpu/drm/vc4/vc4_txp.c` | `d20b0bc51a18632cd2f200a9530684f0bf95bf78` | TXP writeback |
+| `drivers/gpu/drm/vc4/vc4_vec.c` | `11fc3d6f66b1ec5c9c3ff2873f3a21a1cb1cbe68` | VEC |
+| `drivers/gpu/drm/vc4/vc4_dpi.c` | `ef5e3921062c5953924f9bd5b3a1230539797832` | DPI |
+| `drivers/gpu/drm/vc4/vc4_dsi.c` | `b7b2c76770dc6fe5a4eb4fae84453ba891fd4050` | DSI |
+| `drivers/gpu/drm/vc4/vc4_v3d.c` | `(v6.0 tag file; see source link)` | VC4 legacy V3D component |
+| `drivers/clk/bcm/clk-raspberrypi.c` | `876b37b8683c582ef56b0ce36e1e5ea8395d9fa2` | firmware clock provider |
+| `drivers/clk/bcm/clk-bcm2711-dvp.c` | `e63a42618ac2cd7e3657ce84770f91b7e5e1b036` | DVP clock/reset provider |
+| `drivers/i2c/busses/i2c-brcmstb.c` | `69383be4790593b7370880af4b8c367bc4e9c625` | BCM2711 HDMI DDC I2C |
+| `drivers/gpu/drm/v3d/v3d_drv.c` | `8c7f910daa28c1cb486b848cd734baa78c2e17db` | independent BCM2711 V3D DRM driver |
+
+Reference links:
+
+- `https://github.com/torvalds/linux/tree/v6.0/drivers/gpu/drm/vc4`
+- `https://github.com/torvalds/linux/blob/v6.0/drivers/clk/bcm/clk-raspberrypi.c`
+- `https://github.com/torvalds/linux/blob/v6.0/drivers/clk/bcm/clk-bcm2711-dvp.c`
+- `https://github.com/torvalds/linux/blob/v6.0/drivers/i2c/busses/i2c-brcmstb.c`
+- `https://github.com/torvalds/linux/blob/v6.0/drivers/gpu/drm/v3d/v3d_drv.c`
+
+Import policy: use these exact v6.0 files as the source-of-truth for hardware behavior. Do not mix arbitrary `master` revisions into the initial import. If a later fix is required, record its individual upstream commit SHA and rationale in a separate follow-up section. Linux v6.0 DRM APIs are newer than the NetBSD DRM2 snapshot; port the behavior and data structures, not wholesale file replacement.
+
+#### 10.27.2 TXP/VEC/DPI/DSI source and dependency inventory
+
+The four missing files are real upstream source files, not optional stubs. The current NetBSD branch's `files.drmkms` compiles seven VC4 files, but does not list these four. The current `vc4_drv.h` already declares their platform driver symbols and `struct vc4_dev` has members for their state. Adding only their filenames will therefore expose additional LinuxKPI/DRM API dependencies.
+
+| source | upstream purpose and component lifecycle | principal dependency APIs | RPi4 base configuration |
+|---|---|---|---|
+| `vc4_txp.c` | TXP writeback engine; `component_add/del`; adds a writeback connector and updates CRTC possible masks | platform resources/MMIO, IRQ, runtime PM, component framework, DRM writeback connector, atomic state, framebuffer, vblank, OF graph/panel helpers | node exists; verify actual runtime DT status before requiring it |
+| `vc4_vec.c` | Composite PAL/NTSC encoder; creates encoder/connector and variant-specific VEC setup | clocks, runtime PM, component framework, OF graph, DRM encoder/connector, EDID/probe helpers | `brcm,bcm2711-vec` match exists upstream, but base node is disabled |
+| `vc4_dpi.c` | DPI encoder and downstream panel/bridge link | core/pixel clocks, component framework, OF graph, DRM bridge/panel, media-bus formats | matches `brcm,bcm2835-dpi`; base node is disabled |
+| `vc4_dsi.c` | DSI host and encoder; host registration precedes component bind so panel/bridge probing can complete | MIPI-DSI host, clocks, completion, DMA, I2C, MMIO, runtime PM, OF address/graph, DRM MIPI-DSI/bridge/panel, component framework | BCM2711 DSI1 variant exists; base node is disabled |
+
+Important match detail from v6.0:
+
+- TXP: `brcm,bcm2835-txp` (no BCM2711-specific TXP compatible in this source baseline).
+- VEC: `brcm,bcm2835-vec` and `brcm,bcm2711-vec`.
+- DPI: `brcm,bcm2835-dpi`.
+- DSI: `brcm,bcm2711-dsi1`, `brcm,bcm2835-dsi0`, `brcm,bcm2835-dsi1`.
+
+DPI/DSI are not made operational by compiling the source alone. The panel/bridge graph endpoints, panel drivers, clocks, DSI PHY/host and their probe ordering must be present. DSI's upstream probe intentionally registers its `mipi_dsi_host` before `component_add`; moving host registration into master bind would create a panel/bridge probe dependency cycle.
+
+For the first RPi4 HDMI milestone, keep VEC/DPI/DSI optional and do not make disabled nodes a hard prerequisite for master bind. TXP must also be classified from the final runtime DTB: do not assume an enabled optional block from the DTS source alone.
+
+#### 10.27.3 VC5 generation and DRM descriptor
+
+Linux v6.0 `vc4_drv.c` has two distinct descriptors:
+
+- `vc4_drm_driver`: VC4 path, including `DRIVER_RENDER`, VC4 ioctls, legacy VC4 GEM/CMA operations and V3D command submission interfaces.
+- `vc5_drm_driver`: `DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_GEM`; uses the VC5 dumb-buffer/CMA helper operations and the common DRM file operations. It does not advertise `DRIVER_RENDER` and does not register the VC4 command-submission ioctl table.
+
+Master bind checks `brcm,bcm2711-vc5`, selects the descriptor, and sets `vc4->is_vc5`. The v6.0 code has a boolean, not the later generation enum. This is the correct initial RPi4-only behavior to port.
+
+NetBSD implementation boundary:
+
+1. Change `sys/external/bsd/drm2/vc4/vc4_fdt.c` match from the incorrect `brcm,bcm2711-vc4` spelling to the actual `brcm,bcm2711-vc5`; retain only legacy compatibles actually supported by the selected VC4 path.
+2. Add generation data to the NetBSD VC4 master softc / `struct vc4_dev` and select a VC5 descriptor before DRM device allocation.
+3. Define the VC5 descriptor using only DRM2 APIs actually present in this tree. First verify the available GEM DMA/CMA helper, dumb buffer, PRIME and `drm_driver` members. Do not copy `DRM_GEM_CMA_DRIVER_OPS_WITH_DUMB_CREATE` as a macro until the NetBSD DRM2 implementation is confirmed.
+4. Keep VC4-only ioctl registration and legacy V3D command submission inaccessible on VC5. Do not simply set `DRIVER_RENDER` on VC5 to make a render node appear.
+5. Keep generation-dependent behavior explicit. Later `enum vc4_gen` support for VC6 is outside this RPi4-only baseline.
+
+Acceptance: FDT master matches the real VC5 node; VC5 descriptor does not expose VC4 render ioctls; the descriptor compiles and allocates a DRM device using the NetBSD DRM2 ABI.
+
+#### 10.27.4 HVS5 and BCM2711 PixelValve
+
+HVS5 is not a compatible-string-only change. Upstream v6.0 changes hardware-specific data and logic:
+
+- HVS display-list layout differs.
+- LBM size differs.
+- Some pixel-format encodings are reordered.
+- The HVS still has three output FIFOs, while BCM2711 has more PixelValves and a mux connecting PixelValve outputs to HVS outputs.
+- HVS clock acquisition and IRQ handling are part of component bind.
+
+PixelValve data in `vc4_crtc.c` describes BCM2711 PV0..PV4 separately. It includes per-PV HVS output/FIFO availability, FIFO depth, pixels-per-clock and encoder routing. The v6.0 match table includes `brcm,bcm2711-pixelvalve0` through `pixelvalve4`. Do not instantiate all five merely because the driver supports them; attach the nodes that exist and are enabled in the runtime DTB.
+
+NetBSD port targets:
+
+- `sys/external/bsd/drm2/dist/drm/vc4/vc4_hvs.c`: bring over HVS5 register/format/display-list/FIFO behavior and resource/IRQ handling.
+- `sys/external/bsd/drm2/dist/drm/vc4/vc4_crtc.c`: bring over BCM2711 PV variant tables, mux selection and dynamic FIFO assignment.
+- `sys/external/bsd/drm2/dist/drm/vc4/vc4_regs.h` and VC4 register headers: import only the definitions required by the selected v6.0 implementation and check offsets against BCM2711 DTS resources.
+
+Do not enable the old HVS load tracker blindly on VC5. Upstream initially disabled it for BCM2711 because the reworked pipeline invalidated the previous assumptions. Preserve that guard until an equivalent HVS5 load model is implemented and tested.
+
+Acceptance: PV0..PV4 nodes map their own resources/IRQs; HVS5 register access and FIFO assignment are generation-aware; only enabled PVs participate; no two CFATTACH instances claim the same resource.
+
+#### 10.27.5 HDMI0/HDMI1
+
+Linux v6.0 `vc4_hdmi.c` has independent variant data for HDMI0 and HDMI1 and matches:
+
+- `brcm,bcm2711-hdmi0`
+- `brcm,bcm2711-hdmi1`
+
+The HDMI5 register model is split across named resources (HDMI core and related HD/CEC/CSC/DVP/PHY/packet/RM areas). It also has per-output register layouts, PHY lane mapping, maximum pixel clock, external interrupt-controller handling, reset control, CSC setup and HDMI timing programming. This is not equivalent to mapping one BCM2835 HDMI register window twice.
+
+NetBSD targets:
+
+- resource acquisition by FDT `reg-names`, with a named-resource helper or an explicit index table verified against the v6.0 DTS binding;
+- independent softc/encoder/connector per HDMI node;
+- DVP clock and reset provider availability before HDMI bind;
+- firmware pixel/HDMI/audio/BVB clocks as required by the variant;
+- AON interrupt parent and named HPD/CEC event mapping;
+- DDC I2C adapter lookup by the HDMI node's DDC phandle;
+- one connector owner: `vc4_hdmi.c` owns the HDMI connector; do not create a duplicate generic HDMI connector for the same physical output.
+
+The two HDMI nodes may reference a shared register area (notably the common HD block in the RPi4 description). Resource mapping must therefore be coordinated and must not cause conflicting independent `bus_space_map` ownership. Record the actual `reg` and `reg-names` from the final runtime DTB before implementing the map table.
+
+Acceptance: HDMI0 and HDMI1 can be probed independently; each owns one encoder/connector; DDC/EDID resolves to the correct adapter; resource mapping and reset/clock sequences are correct; HPD is delivered from the correct interrupt source.
+
+#### 10.27.6 Firmware Clock, DVP clock/reset and DDC I2C providers
+
+These are three separate providers. Do not merge them into CPRMAN or into `vc4_hdmi.c`.
+
+**A. Raspberry Pi firmware clocks**
+
+Upstream: `drivers/clk/bcm/clk-raspberrypi.c`, compatible `raspberrypi,firmware-clocks`.
+
+- Uses the Raspberry Pi firmware mailbox property interface because firmware owns some clocks and applies thermal/undervoltage policy.
+- Discovers clock IDs and registers a clock provider.
+- v6.0 clock ID table includes EMMC, UART, ARM, CORE, V3D, H264, ISP, SDRAM, PIXEL, PWM, HEVC, EMMC2, M2MC and PIXEL_BVB.
+- This provider is distinct from CPRMAN. A consumer's FDT clock phandle decides which provider is used.
+
+NetBSD current `bcm2835_cprman.c` matches BCM2835 and BCM2711 CPRMAN but registers only UART, VPU, EMMC and EMMC2 clocks. Its `get_rate` switch also only implements those four. It is not a firmware clock provider. Add a separate FDT provider for `raspberrypi,firmware-clocks`, using the existing NetBSD mailbox/firmware property service if its command semantics and lifetime fit; otherwise extend the firmware property transport first. Do not write firmware-owned PLL registers directly.
+
+**B. BCM2711 DVP clock/reset**
+
+Upstream: `drivers/clk/bcm/clk-bcm2711-dvp.c`, compatible `brcm,brcm2711-dvp`.
+
+- Exposes two gate clocks: `hdmi0-108MHz` and `hdmi1-108MHz`.
+- Exposes six reset lines.
+- Uses DVP register offsets `0x04` (software init/reset) and `0x08` (misc clock configuration).
+- The upstream implementation registers both a clock provider and reset controller.
+
+NetBSD `include/linux/reset.h` is currently empty. The current LinuxKPI `clk.h` exposes only a limited NetBSD clock bridge and does not provide Linux `devm_clk_get`, `clk_prepare_enable`, `clk_disable_unprepare`, or clock-provider registration semantics. Before HDMI can use this provider, define the NetBSD FDT clock consumer/provider and reset provider interfaces, including ownership, locking and teardown. Do not add success-returning reset stubs.
+
+**C. BCM2711 HDMI DDC I2C**
+
+Upstream: `drivers/i2c/busses/i2c-brcmstb.c`, compatible `brcm,bcm2711-hdmi-i2c`.
+
+- Uses the BSC register block plus the BCM2711 HDMI auto-I2C release/initialization sequence.
+- Registers an I2C adapter; IRQ is optional and polling fallback exists.
+- Reads `clock-frequency` and handles controller-specific data register width.
+- Adapter registration/removal and the OF node association are essential for HDMI DDC lookup.
+
+NetBSD already has a dedicated DDC controller design in earlier sections and `struct i2c_adapter` / `i2c_algorithm` compatibility types. However, current `i2c_add_adapter()` returns success without registering the adapter, `i2c_del_adapter()` is empty, and `struct i2c_adapter.dev` only stores a NetBSD parent device. A global registry keyed by OF phandle, real add/delete lifetime, and a transfer implementation preserving combined START/RESTART/STOP semantics are required. The BCM2711 DDC node must remain a dedicated controller; do not attach it as a normal BCM2835 BSC instance.
+
+Provider dependency order:
+
+```text
+NetBSD firmware/mailbox service
+       |
+       +--> Raspberry Pi firmware clock provider ----+
+       |                                              |
+CPRMAN clock provider                                 |
+       |                                              v
+       +--------------------------------------> BCM2711 DVP clock/reset
+                                                      |
+BCM2711 HDMI DDC I2C controller --> I2C adapter registry
+                                                      |
+                                                      v
+                                           VC4 HDMI0 / HDMI1 bind
+```
+
+Acceptance: each provider registers a real FDT service; consumers receive valid handles; enable/disable/reset operations affect hardware; provider detach is rejected or safely deferred while consumers remain attached.
+
+#### 10.27.7 NetBSD native component registry and master bind
+
+Current NetBSD state checked:
+
+- `sys/external/bsd/drm2/include/linux/component.h`: `component_add()` always returns 0 and `component_del()` is empty. There is no component match list, master ops, bind-all or unbind-all implementation.
+- `linux/platform_device.h`: platform device has both NetBSD `pd_dev` and Linux-KPI `dev`; `to_platform_device()` is an XXX `device_private(self)` cast. `platform_get_resource()` and `devm_ioremap_resource()` return NULL; `devm_request_irq()` returns 0; `platform_get_irq()` returns the supplied index. The Linux platform driver registration functions are absent.
+- `linux/device.h`: `struct device` contains `device_t bsdev`, not Linux `of_node`. Use the NetBSD device handle / `platform_device_of_node()` mapping, not an invented `dev->of_node`.
+- `sys/arch/arm/broadcom/files.bcm2835`: only the VC4 master `vc4_fdt` CFATTACH is currently registered.
+- `sys/external/bsd/drm2/drm/files.drmkms`: current VC4 list contains `vc4_drv.c`, `vc4_kms.c`, `vc4_crtc.c`, `vc4_hdmi.c`, `vc4_hvs.c`, `vc4_plane.c`, `vc4_v3d.c`; TXP/VEC/DPI/DSI are absent.
+- `vc4_fdt.c` is currently a placeholder and its compatible table contains `brcm,bcm2711-vc4`, not the upstream master compatible `brcm,bcm2711-vc5`.
+
+Recommended native design:
+
+1. Add one CFATTACH/config registration per actual FDT hardware node in the appropriate NetBSD bus/config files. Each attach maps resources using NetBSD FDT APIs and creates a stable platform wrapper that retains `pd_dev` and the OF phandle.
+2. Implement a kernel component registry keyed by OF phandle (or a stable `device_t` identity with phandle validation). Each entry stores component kind, device, bind/unbind callbacks, state, and master association.
+3. Component attach registers an available component; detach removes it only after a successful master unbind. Protect registry and state transitions with a NetBSD kernel lock appropriate to the attach context.
+4. The VC5 master discovers components by OF graph/phandle and required/optional classification. Disabled VEC/DPI/DSI and the separate BCM2711 V3D node must not block HDMI-only KMS.
+5. Bind in the v6.0 upstream order: HVS, HDMI, VEC, DPI, DSI, TXP, CRTC, VC4 legacy V3D component. This is an ordered component bind list, not a CFATTACH attach-order guarantee. Attach order remains controlled by NetBSD autoconfiguration; registry readiness triggers master bind.
+6. Preserve TXP-before-CRTC ordering because TXP writeback changes CRTC possible masks. HVS-before-HDMI is required because HDMI bind reads HVS clock capability. Track each successful bind and unwind in exact reverse order on failure.
+7. DSI host registration must happen during DSI device attach before component bind, preserving upstream panel/bridge probe deferral behavior.
+8. Keep provider and panel/bridge dependency deferral distinct from permanent missing/disabled components. The master must not bind until all required HDMI path providers are ready, but optional outputs must not be required.
+
+Do not implement this by adding prototypes or changing the existing no-op component stubs to return success. Also do not cast `device_t` to `struct device *` or assume `device_private()` has a Linux platform-device layout.
+
+Acceptance: a disabled/missing optional component does not block HDMI; a missing required HVS/HDMI/PV or clock/DDC dependency leaves the master unbound with a diagnosable reason; bind rollback and detach are deterministic; no stale registry pointer survives device detach.
+
+#### 10.27.8 V3D as an independent later driver
+
+BCM2711 V3D is not the VC4 display master's legacy V3D component.
+
+- Linux v6.0 separate driver: `drivers/gpu/drm/v3d/v3d_drv.c`.
+- BCM2711 compatible: `brcm,2711-v3d`.
+- VC4 component file `drivers/gpu/drm/vc4/vc4_v3d.c` matches `brcm,bcm2835-v3d`, `brcm,cygnus-v3d`, and `brcm,vc4-v3d`, not `brcm,2711-v3d`.
+- The separate V3D driver has its own DRM descriptor, GEM, IRQ, clock, reset and MMU initialization path.
+
+Therefore:
+
+1. Do not add `brcm,2711-v3d` to `vc4_v3d_dt_match[]`.
+2. Do not make the VC5 HDMI display master wait for the separate V3D DRM device.
+3. First complete HDMI/KMS and framebuffer console.
+4. Port `drivers/gpu/drm/v3d/` as an independent NetBSD DRM device with its own CFATTACH/config entry and DRM registration lifecycle.
+5. Verify DMA/IOMMU, clocks, reset, interrupts, firmware memory and GEM allocation independently.
+
+Acceptance: VC5 display works with V3D disabled/unattached; the separate V3D device can be enabled later without changing HDMI component registry semantics.
+
+#### 10.27.9 genfb to DRMKMS console handoff — final phase
+
+NetBSD current source observations:
+
+- `sys/arch/arm/broadcom/bcm2835_genfb.c` reads the `is_console` property, initializes `genfb`, maps the firmware framebuffer and calls `genfb_attach()`.
+- It exports `bcmgenfb_set_console_dev()`, `bcmgenfb_set_ioctl()` and a DDB polling callback.
+- `sys/dev/wsfb/genfbvar.h` declares `genfb_cndetach()`, `genfb_disable()`, `genfb_is_console()`, `genfb_is_enabled()`, `genfb_enable_polling()` and `genfb_disable_polling()`.
+- In `sys/dev/wsfb/genfb.c`, `genfb_cndetach()` only clears the `genfb_cnattach_called` flag; `genfb_disable()` only clears `genfb_enabled`. These functions do not themselves unmap the framebuffer, detach the device, free firmware memory, or transfer the scanout buffer to DRM.
+- Linux v6.0 master calls `drm_fb_helper_remove_conflicting_framebuffers()` before KMS setup and then `drm_fbdev_generic_setup()`. Those Linux calls have no automatic NetBSD equivalent.
+
+Handoff must be implemented as a NetBSD console ownership transition, not as a blind call to `genfb_disable()`.
+
+Proposed sequence:
+
+1. Record the boot framebuffer's physical range, dimensions, pitch, format, `is_console` state and ownership/reservation. Do not allocate DRM scanout memory over the firmware framebuffer.
+2. Initialize the VC5 master, required components, KMS and a DRM framebuffer successfully while the genfb framebuffer remains valid.
+3. Determine whether the active genfb is actually the system console using `genfb_is_console()` and whether genfb is enabled. Do not detach a non-console genfb instance.
+4. Provide a DRM2-native wsdisplay/console frontend or a supported framebuffer adoption path. First prove that the DRM framebuffer can be used by the console; a modeset-only test is not a console handoff.
+5. Switch console drawing/polling ownership to the DRM frontend, then disable old genfb console output using the appropriate genfb state transition. Treat `genfb_cndetach()` as a console marker operation only, not a resource release.
+6. Keep the original firmware framebuffer mapped/reserved until no console, mmap or other consumer references it. Only release/unmap after ownership and lifetime are proven.
+7. Implement rollback: if DRM initialization or console attachment fails, genfb remains the active console. If the new console fails after transition, restore the previous framebuffer if it is still valid.
+8. Test boot messages, panic/DDB, wsdisplay switching, suspend/resume if supported, and repeated attach/detach.
+
+Acceptance: no blank console during failed KMS probe; no double writer to the same scanout buffer; no framebuffer memory overlap; DDB/panic output remains available; the old framebuffer is released only after all references are gone.
+
+#### 10.27.10 Consolidated implementation order and gates
+
+| Phase | Work | Files / subsystem | Gate before proceeding |
+|---:|---|---|---|
+| 0 | Freeze Linux v6.0 source baseline and runtime DTB | upstream blob table; BCM2711 DTB | all compatible/reg/IRQ/clock/interrupt references are recorded |
+| 1 | Add missing TXP/VEC/DPI/DSI sources and real dependencies | VC4 source files; `files.drmkms` | each source compiles with its feature dependencies or is explicitly optional |
+| 2 | Implement VC5 generation and descriptor | `vc4_fdt.c`, `vc4_drv.c`, `vc4_drv.h` | VC5 descriptor does not expose VC4 render/legacy ioctls |
+| 3 | Port HVS5 and PV0..PV4 | `vc4_hvs.c`, `vc4_crtc.c`, register headers | HVS/PV resources and FIFO routing validated |
+| 4 | Port HDMI0/1 | `vc4_hdmi.c`, resource/IRQ helpers | independent connectors, clocks, reset, DDC and HPD validated |
+| 5 | Implement firmware clock, DVP clock/reset and DDC I2C providers | Broadcom FDT clock/reset; mailbox; I2C | no success-only stubs; provider/consumer lifecycle validated |
+| 6 | Implement NetBSD component registry and master bind | `component.h` replacement/native coordinator; CFATTACH/config | required/optional policy, ordering, rollback and detach validated |
+| 7 | Port separate V3D | `drivers/gpu/drm/v3d/` equivalent | independent DRM device; VC5 display unaffected when disabled |
+| 8 | genfb to DRMKMS handoff | `bcm2835_genfb.c`, genfb, DRM2 console | boot/panic/DDB and rollback tested |
+
+The dependency graph is:
+
+```text
+Runtime DTB + NetBSD FDT autoconfiguration
+                 |
+       VC5 master CFATTACH
+                 |
+        component registry
+                 |
+       +---------+------------------+
+       |                            |
+ firmware clock provider       CPRMAN provider
+       |                            |
+       +---------- DVP clock/reset -+
+                    |
+              HVS5 + HDMI0/1
+                    |
+           PixelValve0..4 / TXP
+                    |
+              VC5 DRM/KMS
+                    |
+             genfb handoff
+                   
+ Separate branch: V3D DRM device (`brcm,2711-v3d`)
+```
+
+The component bind order is HVS → HDMI → VEC → DPI → DSI → TXP → CRTC → legacy VC4 V3D component, but only the required and enabled nodes are bound. NetBSD CFATTACH attach order is not forced to match this list; registry readiness and master coordination enforce bind dependencies.
+
+#### 10.27.11 Scope and validation status
+
+Confirmed from inspected NetBSD source:
+
+- VC5 FDT match string in `vc4_fdt.c` is currently `brcm,bcm2711-vc4`; it does not match the upstream `brcm,bcm2711-vc5`.
+- The four TXP/VEC/DPI/DSI files are absent from current `files.drmkms`.
+- Component framework functions are no-op stubs.
+- Platform resource, IRQ and ioremap helpers are stubs/incomplete.
+- LinuxKPI reset header is empty; clock bridge is limited.
+- I2C adapter add/delete are no-op stubs.
+- genfb console marker and enable flags exist, but they do not implement full DRM ownership transfer.
+
+Not yet established:
+
+- Final runtime DTB values after firmware overlays and boot configuration.
+- Exact NetBSD native reset-provider API suitable for the BCM2711 DVP controller.
+- Complete firmware property-clock service contract and whether existing mailbox facilities can be reused directly.
+- Full panel/bridge topology for enabled DPI/DSI overlays.
+- A completed DRM2 wsdisplay/console framebuffer adoption path.
+
+No C source was changed, no provider or component registry was implemented, no DTB was rebuilt, and no GitHub Actions or hardware test was run. The next safe code change is Phase 0/2 preparation: fix the master compatible and add an explicit VC5 generation selection only after the v6.0 descriptor's DRM2 API dependencies have been checked. Do not begin by adding all four source files or by making the current stubs return success.
