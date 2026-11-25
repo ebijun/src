@@ -2164,3 +2164,154 @@ if (ddc_node < 0)
 また、本helperの戻り値は現時点で `int` / `-1` とする設計である。NetBSDのOF node値に負値が使われないことを対象ブランチのAPI契約で再確認する。将来、より明確なエラー伝達が必要になった場合は、戻り値とnode出力引数を分離するAPIへの変更を検討し、その際は呼び出し側を含めて仕様を更新する。
 
 この仕様書の追加時点では、helper本体のC実装・コンパイル・実機動作確認は未実施である。
+
+
+### 10.20 実装対象helperの実装仕様 — `platform_device_of_node()`
+
+10.19節のAPI契約を、実際に `platform_device.h` へ実装するための具体的な仕様に落とし込む。本節では関数本体、依存ヘッダー、処理順序、禁止事項、レビュー・検証項目を定める。ここで示すコードは実装予定コードであり、この追記時点ではソースへ適用していない。
+
+#### 10.20.1 実装対象と既存構造
+
+対象ファイル:
+
+`sys/external/bsd/drm2/include/linux/platform_device.h`
+
+現行ヘッダーには次の構造がある。
+
+```c
+struct platform_device {
+        device_t        pd_dev;
+        struct device   dev;
+        uint64_t        id;
+        /* ... */
+};
+```
+
+同ヘッダーは既に `<sys/device.h>` をincludeしている。したがって `device_t`、`devhandle_t`、`device_handle()`、`devhandle_is_valid()`、`devhandle_type()`、`DEVHANDLE_TYPE_OF` は既存includeから参照できる。新たに同じヘッダーを重複includeしない。
+
+`devhandle_to_of()` の宣言は `<dev/ofw/openfirm.h>` にあるため、このヘッダーを追加する。includeは既存のシステムヘッダー群の後、Linux-KPIヘッダー群の前に置く。
+
+#### 10.20.2 実装する関数本体
+
+実装予定コード:
+
+```c
+#include <dev/ofw/openfirm.h>
+
+/*
+ * Return the Open Firmware node handle for a platform device,
+ * or -1 if the device has no valid OF device handle.
+ */
+static inline int
+platform_device_of_node(const struct platform_device *pdev)
+{
+        devhandle_t handle;
+
+        if (pdev == NULL || pdev->pd_dev == NULL)
+                return -1;
+
+        handle = device_handle(pdev->pd_dev);
+        if (!devhandle_is_valid(handle))
+                return -1;
+        if (devhandle_type(handle) != DEVHANDLE_TYPE_OF)
+                return -1;
+
+        return devhandle_to_of(handle);
+}
+```
+
+`devhandle_is_valid()` の検査を `devhandle_type()` より先に行う。さらに `devhandle_type()` がOF型であることを確認してから `devhandle_to_of()` を呼ぶ。`devhandle_to_of()` はOF型以外のhandleに対して使用してはならない。
+
+#### 10.20.3 処理順序と失敗条件
+
+| 順序 | 処理 | 失敗条件 | 戻り値 |
+|---:|---|---|---:|
+| 1 | `pdev` を検査 | NULL | -1 |
+| 2 | `pdev->pd_dev` を検査 | NULL | -1 |
+| 3 | `device_handle(pdev->pd_dev)` | — | handle |
+| 4 | `devhandle_is_valid(handle)` | invalid handle | -1 |
+| 5 | `devhandle_type(handle)` | `DEVHANDLE_TYPE_OF` 以外 | -1 |
+| 6 | `devhandle_to_of(handle)` | OF node値を取得 | node値 |
+
+NULL/invalid/non-OFを個別のerrnoに分類しない。関数の責務はOF node値の取得に限定し、詳細な診断やerrnoへの変換は呼び出し側で行う。
+
+#### 10.20.4 戻り値と呼び出し側の規約
+
+- 成功時は `devhandle_to_of(handle)` の返却値を変更せず返す。
+- 失敗時は `-1` を返す。
+- 呼び出し側は `node < 0` で失敗判定する。
+- 呼び出し側は失敗を `-ENXIO` 等の適切なerrnoへ変換する。
+- 成功したnode値はNetBSD OF/FDT APIにのみ渡す。
+- node値に対して `of_node_put()` を呼ばない。
+- helper内でproperty検索、phandle解決、I2C/GPIO取得、probe延期処理を行わない。
+
+#### 10.20.5 実装してはならないこと
+
+次の実装は行わない。
+
+1. `struct device` にLinux互換の `of_node` メンバーを追加する。
+2. `pdev->dev.bsdev` を実deviceだと仮定して参照する。
+3. `device_private()` からplatform deviceを再取得する。
+4. handle種別の確認前に `devhandle_to_of()` を呼ぶ。
+5. invalid handleをOF handleとして扱う。
+6. 整数node値を `struct device_node *` にcastする。
+7. node値をglobal/static変数へcacheする。
+8. helperの中で `of_node_get()` / `of_node_put()` 相当の参照管理を追加する。
+9. DDC controller未登録やGPIO取得失敗をhelperの戻り値へ混在させる。
+
+#### 10.20.6 呼び出し側変更の仕様
+
+最初の利用箇所は `vc4_hdmi_bind()` とする。呼び出し側は既に取得している `struct platform_device *pdev` を渡す。
+
+```c
+int node;
+
+node = platform_device_of_node(pdev);
+if (node < 0) {
+        device_printf(pdev->pd_dev,
+            "device has no OF/FDT node\\n");
+        return -ENXIO;
+}
+```
+
+この `node` を `fdtbus_get_phandle(node, "ddc")` 等のNetBSD FDT APIに渡す。従来のLinux `of_parse_phandle(dev->of_node, ...)` と `of_node_put()` は、node値ベースのNetBSD APIへ置き換える範囲で削除する。I2C adapter取得とHPD GPIO取得は、それぞれ別のbridge/API変更として扱う。
+
+#### 10.20.7 include・依存関係の仕様
+
+| ヘッダー | 用途 | 対応 |
+|---|---|---|
+| `<sys/device.h>` | `device_t`、devhandle関連API | 既存include済み。重複追加しない |
+| `<dev/ofw/openfirm.h>` | `devhandle_to_of()` | 新規include |
+| `<sys/types.h>` | 基本型 | 既存includeを維持 |
+| `<linux/device.h>` | Linux-KPI `struct device` | 既存includeを維持 |
+
+helperは `platform_device` 定義の後に置く。これにより `pdev->pd_dev` のメンバー参照が可能になる。関数をヘッダー内の `static inline` とし、追加の外部シンボルやMakefile変更を必要としない形にする。
+
+#### 10.20.8 実装レビュー・検証項目
+
+実装パッチのレビューでは次を確認する。
+
+- [ ] `<dev/ofw/openfirm.h>` が追加されている。
+- [ ] `struct platform_device` の定義後にhelperが配置されている。
+- [ ] `pdev` と `pdev->pd_dev` のNULL検査がある。
+- [ ] `devhandle_is_valid()` をhandle種別判定より先に実行する。
+- [ ] `DEVHANDLE_TYPE_OF` を確認した後にのみ `devhandle_to_of()` を呼ぶ。
+- [ ] 失敗値は一貫して `-1`、成功値は `devhandle_to_of()` の値そのもの。
+- [ ] `bsdev`、`of_node`、Linux `device_node` に依存していない。
+- [ ] VC4 bind側が失敗値をerrnoへ変換し、成功nodeにput処理を行わない。
+- [ ] GitHub Actionsで対象アーキテクチャの `vc4_hdmi.o` がコンパイルされる。
+- [ ] 診断ログまたは実機で `pdev->pd_dev` のhandleがOF型であり、node値がFDT APIで利用可能であることを確認する。
+
+コンパイル成功だけでは、対象deviceにOF handleが正しく設定されていることまでは証明できない。handle種別とnode値の実行時確認を別の受け入れ条件とする。
+
+#### 10.20.9 実装段階の完了条件
+
+このhelperの実装段階は、次のすべてを満たした時点で完了とする。
+
+1. ヘッダーにhelperが実装され、NetBSDカーネルの対象構成でコンパイルできる。
+2. VC4 HDMI bind経路からhelperを呼び出せる。
+3. FDT型handleで正しいnode値を返すことを診断ログまたは実機で確認できる。
+4. NULL/invalid/non-OF handleで安全に失敗することをコードレビューで確認できる。
+5. DDC I2C bridgeおよびHPD GPIO bridgeの未実装部分を、このhelperの完了と混同しない。
+
+本節は実装仕様であり、コードの適用やActionsによる検証結果を示すものではない。
