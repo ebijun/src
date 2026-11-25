@@ -4733,3 +4733,167 @@ Linux v6.0 VC5はVC4 DRM driver内のsub-block構成である。NetBSD側でCFAT
 - EDK2 xHCI SSDT: [Xhci.asl](https://github.com/tianocore/edk2-platforms/blob/master/Platform/RaspberryPi/AcpiTables/Xhci.asl)
 
 本節は調査結果と設計計画の追記であり、kernel、EFI bootloader、PFTF firmware、DTB、config.txtの変更は行っていない。GitHub Actionsおよび追加の実機boot testは未実施。
+
+
+## 10.31 bcm2838pcie_fdt が実機でattachしない原因調査（2026-11-26）
+
+### 10.31.1 結論
+
+ソースツリーのPCIe host driver実装および `files.bcm2835` のdevice/attach/file宣言は存在する。一方、実機で使用したと考えられる標準kernel config `sys/arch/evbarm/conf/GENERIC64` には、`bcm2838pcie` をFDT busへ接続するconfig attachment行が見つからなかった。
+
+この差が今回の
+
+```
+/scb/pcie@7d500000 at simplebus3 not configured
+```
+
+の最有力原因である。PCIe host driverのmatch、register mapping、link training、VL805 reset処理へ到達する前に、kernel configがCFATTACHを有効化していない可能性が高い。
+
+したがって、前節10.30.4の「driver source/config entryあり」は表現が不正確だった。正しくは「`files.bcm2835` にdevice/attach/file宣言はあるが、確認した `GENERIC64` の接続指定は欠落している」である。
+
+### 10.31.2 構成ファイルの照合
+
+#### `sys/arch/arm/broadcom/files.bcm2835`
+
+次の宣言が存在する。
+
+```
+# Broadcom STB PCIE host
+device  bcm2838pcie: pcibus
+attach  bcm2838pcie at fdt with bcm2838pcie_fdt
+file    arch/arm/broadcom/bcm2838_pcie.c bcm2838pcie
+```
+
+これはデバイス型、FDT attachment実装、C source fileをNetBSD config systemへ登録する宣言である。これだけで個々のkernel configに接続指定が自動追加されるわけではない。
+
+#### `sys/arch/evbarm/conf/files.generic64`
+
+このファイルは次をincludeしている。
+
+```
+include "arch/arm/broadcom/files.bcm2835"
+```
+
+従ってGENERIC64のconfig処理はBroadcomのdevice宣言ファイルを読み込む。問題はdevice宣言ファイルそのものがincludeされていないことではない。
+
+#### `sys/arch/evbarm/conf/GENERIC64`
+
+PCIE sectionには以下がある。
+
+```
+pcihost* at fdt?             # Generic PCI host controller
+acpipchb* at acpi?           # ACPI PCIe host bridge
+pci*    at pcibus?
+ppb*    at pci? dev ? function ?
+pci*    at ppb?
+```
+
+しかし、このPCIE sectionにもファイル全体にも、次の接続指定が確認できなかった。
+
+```
+bcm2838pcie* at fdt?
+```
+
+GENERIC64は末尾で `GENERIC64.local` をcincludeするため、実際に起動したkernelが独自local configを使用していれば別途確認が必要である。ただし、標準GENERIC64だけを使った場合はbcm2838pcieのFDT attachmentが構成されない。
+
+### 10.31.3 FDT nodeとdriver matchの照合
+
+NetBSD同梱 `bcm2711.dtsi` のPCIe nodeは次の内容である。
+
+```dts
+pcie0: pcie@7d500000 {
+        compatible = "brcm,bcm2711-pcie";
+        reg = <0x0 0x7d500000 0x9310>;
+        device_type = "pci";
+        ...
+};
+```
+
+`sys/arch/arm/broadcom/bcm2838_pcie.c` の `compat_data[]` は次の2つをmatch対象にする。
+
+```c
+static const struct device_compatible_entry compat_data[] = {
+        { .compat = "brcm,pci-plat-dev" },
+        { .compat = "brcm,bcm2711-pcie" },
+        DEVICE_COMPAT_EOL
+};
+```
+
+したがって、NetBSD同梱DTSのcompatibleとdriver match tableは一致する。nodeにはreg、ranges、interrupt-map、dma-rangesも定義されている。DTS sourceの範囲では、compatible不一致を第一原因とする根拠はない。実機が使用したDTBが同梱DTSと同一であるかはruntime dump未取得のため未確定。
+
+### 10.31.4 「not configured」が示す段階
+
+FDT simplebusはnodeを列挙するが、kernel configに対応するattachmentがなければdeviceはconfigureされず、dmesgに `at simplebusN not configured` と表示される。
+
+今回のログはPCIe node自体を認識している。これはFDT nodeがsimplebus配下に存在することを示すが、`bcm2838pcie_match()` / `bcm2838pcie_attach()` が呼ばれた証拠ではない。
+
+特に `bcm2838pcie_attach()` が実行されて初めて、次の処理へ進む。
+
+1. `fdtbus_get_reg()` でPCIe host register rangeを取得。
+2. `bus_space_map()` でregisterをmap。
+3. PCIe DMA tagの3GB subregionを作成。
+4. `bcmstb_attach()` / `bcmstb_config()` でPCI host bridgeを初期化。
+5. `bcmstb_setup()` でcontroller reset、PERST解除、PHY/link-upを待つ。
+6. `pci_configure_bus()` でPCI busをconfigure。
+7. PCI config hookでVL805 (VIA vendor/device)を検出した場合、`rpi_notify_xhci_reset()` を呼ぶ。
+
+今回の `not configured` はこの処理列の入口より前のkernel configuration問題と整合し、PCIe PHY/link failureやVL805 firmware reset failureを示すログではない。従って、まずconfig attachmentを有効化しないままlink trainingやVL805 resetをデバッグするのは順序が逆である。
+
+### 10.31.5 最小修正候補
+
+標準 `GENERIC64` に追加する場合は、PCIE sectionへ次を追加する。
+
+対象: `sys/arch/evbarm/conf/GENERIC64`
+
+```diff
+ # PCIE
++bcm2838pcie* at fdt?             # Broadcom BCM2711 PCIe host
+ pcihost*       at fdt?           # Generic PCI host controller
+ acpipchb*      at acpi?          # ACPI PCIe host bridge
+```
+
+個別kernel configで試す場合は、そのconfigの末尾からincludeされる `GENERIC64.local` に同じattachment行を追加する方法もある。実際にビルドしたconfig名とlocal fileの有無を確認してから選択する。
+
+この段階では `bcm2838_pcie.c` の変更は不要と考える。まずconfig attachmentだけを追加したkernelをビルドし、次のログが出るか確認する。
+
+- `bcm2838pcie0: Broadcom PCIE Host Controller` 相当のattach表示
+- `Using 3GB DMA subregion`（DMA subregion取得が成功した場合）
+- `RootBridge Revision ...`
+- `PCIe link not ready` または `PCIe link not in RC mode` が出るか
+- PCI bus下にVL805のPCI functionが列挙されるか
+- `xhci*` がattachし、USB keyboardが `ukbd*` / `wskbd*` まで到達するか
+
+attach表示が出た後に `configuration failed`、register mapping error、link failureが出る場合は、その段階のログに基づき別問題として解析する。
+
+### 10.31.6 検証時の注意点
+
+- 実機で起動したkernelのconfigがGENERIC64か、GENERIC64.localを含む独自configかを確認する。
+- GitHub Actionsでビルドしたkernelのconfigと、SDカード上の `netbsd.img` が同一revisionか確認する。
+- 追加後は生成された `<arch/evbarm/conf/GENERIC64>` とconfig結果を確認し、`bcm2838pcie` が実際に含まれることを確認する。
+- まずACPI無効のDTB起動でPCIe host attachを試す。USB keyboardが使えないため、serial consoleまたは確実な自動root指定を準備してから実施する。
+- ACPI有効起動で同じFDT driverを試すことはできない。ACPI有効時の合成FDTには `/scb/pcie@7d500000` がないためである。
+
+### 10.31.7 判定と次の作業
+
+| 項目 | 判定 |
+|---|---|
+| PCIe driver source | 存在 |
+| `files.bcm2835` device/attach/file | 登録済み |
+| `files.generic64` からのinclude | 確認済み |
+| BCM2711 DTS compatible | driver matchと一致 |
+| 標準 `GENERIC64` attachment | `bcm2838pcie* at fdt?` が欠落 |
+| 実機not configuredの最有力原因 | kernel config attachment不足 |
+| PCIe link / VL805 firmware | driver attach前のため未評価 |
+
+次の作業は、kernel configに `bcm2838pcie* at fdt?` を追加してビルドし、DTB起動でPCIe host attachの有無を確認することである。これでattachすれば、次段階としてPCIe link、PCI bus enumeration、VL805 reset、xHCI attachを順番に調べる。
+
+本節はソース照合と原因分析の記録であり、GENERIC64、bcm2838_pcie.c、files.bcm2835へのコード変更はまだ行っていない。kernel build、GitHub Actions、実機再起動テストも未実施。
+
+### 10.31.8 参照ソース
+
+- [GENERIC64](https://github.com/ebijun/src/blob/vc4-drmkms/sys/arch/evbarm/conf/GENERIC64)
+- [files.generic64](https://github.com/ebijun/src/blob/vc4-drmkms/sys/arch/evbarm/conf/files.generic64)
+- [files.bcm2835](https://github.com/ebijun/src/blob/vc4-drmkms/sys/arch/arm/broadcom/files.bcm2835)
+- [bcm2838_pcie.c](https://github.com/ebijun/src/blob/vc4-drmkms/sys/arch/arm/broadcom/bcm2838_pcie.c)
+- [bcm2711.dtsi](https://github.com/ebijun/src/blob/vc4-drmkms/sys/external/gpl2/dts/dist/arch/arm/boot/dts/broadcom/bcm2711.dtsi)
+- [bcm2711-rpi-4-b.dts](https://github.com/ebijun/src/blob/vc4-drmkms/sys/external/gpl2/dts/dist/arch/arm/boot/dts/broadcom/bcm2711-rpi-4-b.dts)
