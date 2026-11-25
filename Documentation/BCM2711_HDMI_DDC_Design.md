@@ -4594,3 +4594,142 @@ NetBSD EFI bootloaderはこのConfiguration TableからDTBを取得し、必要�
 - UEFI Specification, EFI System Table / Devicetree Tables: [UEFI Specification](https://github.com/UEFI/UEFI-Specification-Release/blob/main/source/04_EFI_System_Table.rst)
 
 今回の調査はドキュメント追記のみであり、kernel、EFI bootloader、PFTF firmware、config.txtは変更していない。GitHub Actions buildおよび追加の実機boot testも実行していない。
+
+
+## 10.30 RPi4実機FDT比較、ACPI/XHCI、DTB PCIeおよびVC5 attach計画（2026-11-25）
+
+### 10.30.1 実機FDT比較
+
+NetBSD 11.99.11 / Raspberry Pi 4 Model B / PFTF UEFIでACPI有効起動と `acpi off` 起動を比較した。
+
+| 観測 | ACPI有効 | `acpi off` |
+|---|---|---|
+| root compatible | `netbsd,generic-acpi` | BCM2711元DTB経路 |
+| `/soc` | ofctlでnot found | dmesgに表示ノード列挙 |
+| `/scb/pcie@7d500000` | ofctlでnot found | dmesgでnot configured |
+| HVS/PV/TXP/HDMI | FDTに見えない | simplebusで列挙、未attach |
+| xHCI | ACPI XHC0でattach | USB-A側xHCI確認できず |
+| USB keyboard | ukbd0/wskbd0 attach | root promptで入力不能 |
+
+ACPI有効時の `ofctl -pv` はroot、memory、acpi、chosen、framebufferを含む最小FDTで、root compatibleは `netbsd,generic-acpi`。追加で `ofctl -p /soc`、`ofctl -p /scb/pcie@7d500000` はnode not foundとなった。
+
+`acpi off` のdmesgでは `/soc/txp@7e004000`、`/soc/hvs@7e400000`、PixelValve PV0/PV1/PV2/PV4/PV3、HDMI0/HDMI1、`/scb/pcie@7d500000`、V3Dが列挙された。not configuredはFDT node列挙後に対応driverがattachしていない状態であり、hardware disabledの証拠ではない。DTB起動時の完全な `ofctl -pv` は未取得。
+
+ACPI起動時のキーボードは `uhidev0 -> ukbd0 -> wskbd0` と認識され、`wskbd0: console keyboard, using wsdisplay0` を確認した。EFI bootloaderでは入力可能だが、`acpi off` でkernelへ移行するとUSB keyboardは反応しない。
+
+### 10.30.2 NetBSD EFI bootloaderのFDT選択
+
+調査対象: `sys/stand/efiboot/efiacpi.c`、`efifdt.c`。
+
+- `efi_acpi_probe()` はEFI System Configuration TableからACPI 2.0 RSDPを取得し、SMBIOS tableも取得する。
+- `efi_acpi_available()` はACPI root tableが存在し、bootloader内部の `acpi_enabled` がtrueの場合にtrue。
+- `efi_fdt_probe()` はEFI Configuration TableのFDT_TABLE_GUIDからFDTを取得し、headerを検証する。
+- `efi_fdt_prepare_boot()` はinitrdとDTB fileをloadし、kernel ELF準備後、ACPI対応ビルドかつACPI availableかつlittle-endian kernelなら `efi_fdt_create_acpifdt()` を優先する。
+- それ以外ではロード済みDTBを `efi_fdt_set_data()` でコピーする。
+- 選択したFDTへoverlay、initrd、RNG、bootargs、EFI System Table、GOP framebuffer、memory map等を追加してkernelへ渡す。
+
+`efi_fdt_create_acpifdt()` は空FDTを作り、rootへ `compatible = "netbsd,generic-acpi"` とSMBIOS由来modelを設定する。`/chosen` にACPI root/SMBIOS pointer、`/acpi` に `compatible = "netbsd,acpi"` を作る。元BCM2711 DTBをmergeする処理ではない。GOP framebuffer等は後続処理で追加される。
+
+よってACPI有効時に `/soc` が見えないのは、PFTFがDTBを渡していないと直ちに結論づけるべきではなく、NetBSD EFI bootloaderがACPI有効時に合成FDTを選ぶ実装と整合する。`acpi off` はこの分岐を外し、DTB fileがloadされていれば元DTBをset_dataする経路へ進む。今回のdmesgはその実機証拠である。
+
+なお、EFI Configuration TableのFDT pointerと、`get_dtb_path()` によってbootloaderがファイルから読むDTBは別の入力経路である。boot.cfg、bootloader version、実際のDTB指定を保存し、どちらを使ったかを確定する必要がある。
+
+### 10.30.3 PFTF/EDK2 ACPI tableのxHCI公開
+
+実機ACPIログには `SSDT ... RPIFDN RPI4XHCI` があり、`xhci0 at acpi0 (XHC0, PNP0D10-0)`、MMIO `0x600000000-0x600000fff`、IRQ 175でattachした。
+
+EDK2 source `Platform/RaspberryPi/AcpiTables/Xhci.asl`（SSDT signature `RPI4XHCI`）では以下を定義する。
+
+- `SCB0` は `ACPI0004` container。
+- `SCB0._CRS` はPCIe CPU MMIO window。
+- `SCB0._DMA` はDMA範囲を0～`0xbfffffff`（最初の3GB）に制限。
+- `SCB0.XHC0` は `PNP0D10` generic xHCI device。
+- `XHC0._CRS` はPCIe MMIO windowの4KBとIRQ 175。
+- `XHC0._INI` はPCIe config command registerに0x6を書き、MMIO decodeとbus masterを有効化。
+- `_DSM` は32-bit register accessを通知。
+
+このSSDTがVL805接続xHCIをACPI deviceとしてOSに直接公開する。NetBSDもPCI bus scanではなく `xhci0 at acpi0` としてattachする。
+
+確認したACPI sourceと実機ログではHVS、PixelValve、HDMI0/1、TXP専用のACPI device/SSDTは見つからず、表示ブロックのACPI attachも確認できない。ただし全ACPI namespace/DSDT dumpは未取得なので、全テーブルに存在しないとまでは断定しない。現時点でACPI経路が確実に提供するのはxHCIであり、VC5表示blockのresource providerとは確認できない。
+
+### 10.30.4 DTB起動時PCIe hostとVL805
+
+NetBSD sourceを確認した。
+
+- `sys/arch/arm/broadcom/bcm2838_pcie.c`
+- `sys/arch/arm/broadcom/bcm2838_pcie.h`
+- `sys/arch/arm/broadcom/files.bcm2835`
+
+`files.bcm2835` には `bcm2838pcie` device、FDT attach、source file登録が既にある。FDT match compatibleは `brcm,pci-plat-dev` と `brcm,bcm2711-pcie`。
+
+NetBSD同梱 `bcm2711.dtsi` の `scb/pcie@7d500000` は `compatible = "brcm,bcm2711-pcie"`、register `0x7d500000` size `0x9310`。したがってsource DTS compatibleとdriver matchは一致する。
+
+driverはFDTからreg/rangesを取得し、PCIe host reset/setup、PERST解除、PHY/link-up待ち、PCI bus構成を行う。RPi4のPCIe DMA制限として0～`0xbfffffff` のsubregionも設定する。
+
+しかし実機DTB boot dmesgは `/scb/pcie@7d500000 at simplebus3 not configured`。つまり実機kernelでPCIe host CFATTACHがattachしていない。driver sourceが存在することと、対象kernelに組み込まれattachすることは別である。直接原因は未確定。kernel configでのdevice inclusion、実機kernelとsource revisionの一致、runtime node compatible/status、FDT match結果を調べる。
+
+RPi4 board DTSの `&pcie0` childにはPCI function `usb@0,0` とfirmware reset ID `RASPBERRYPI_FIRMWARE_RESET_ID_USB` がある。PCIe host attach後にVL805が出ない場合はreset/firmware初期化、PCI config vendor/device ID、bus enumeration、DMA/interrupt routingを調べる。
+
+したがって「NetBSDにPCIe driverがない」は誤り。より正確には「driver sourceとFDT matchは存在するが、今回のDTB起動kernelではPCIe nodeがnot configuredとなり、VL805/xHCIまで到達していない可能性が高い」。attach失敗の原因は未確定。
+
+### 10.30.5 DTB起動でkeyboardを使うための作業環境
+
+USB-A keyboardの動作はACPI有効時に確認済み。USB-Cは電源入力用で、keyboard接続先ではない。DTB起動でUSB-A keyboardを使う第一候補はPCIe host CFATTACHとVL805/xHCI列挙を成立させること。
+
+実機調査の安全策:
+
+1. 日常作業はACPI有効の既知正常環境で続ける。
+2. DTB起動検証用にPL011/AUX UART等のserial consoleを確保する。PFTFのSPCR/console設定とNetBSD console driverを照合し、bootloader/kernel双方で同じUARTを使う。
+3. serial console確保まではDTB起動を常用しない。
+4. root prompt回避のboot.cfg設定はboot.cfg構文とGPT wedge root指定をソースで確認してから行い、未検証の `root=dk1` 等を推測で設定しない。
+
+### 10.30.6 VC5 HVS / PixelValve / HDMI CFATTACH設計
+
+`files.bcm2835` には既存VC4 DRM FDT front-end `vc4drm` / `vc4_fdt` の登録があるが、HVS、PixelValve、TXP、HDMIを独立CFATTACHとして登録する行は確認できない。
+
+Linux v6.0 VC5はVC4 DRM driver内のsub-block構成である。NetBSD側でCFATTACH化する場合、Linux component bindを独立attachへ単純置換せず、FDT resource providerとVC5 master KMS orchestrationを分離する。
+
+| NetBSD要素 | 責務 |
+|---|---|
+| VC5 FDT front-end/master | compatible match、FDT graph/child探索、依存関係、bind順序/rollback |
+| HVS provider | register/IRQ取得、private state、master登録 |
+| PixelValve provider | PV0/1/2/4/3のinstance識別、register/IRQ、CRTC/HVS対応 |
+| HDMI provider | HDMI0/1、複数reg/reg-names、DVP clock/reset、AON IRQ、DDC、connector lifecycle |
+| TXP provider | register/IRQ、必要な場合の独立attach |
+| VC5 master KMS | DRM device、CRTC/encoder/connector、atomic modeset、GEM、lifetime |
+
+推奨実装順:
+
+1. runtime DTBでGPU/HVS/PV/HDMI/DVP/DDCのstatus、reg、interrupt、clock、reset、graphを採取。
+2. NetBSD FDT APIでresource取得可否を確認。
+3. HVS/PVのresource-only CFATTACH骨格を作り、mapping/IRQを段階検証。
+4. HDMIは複数reg、DVP reset/clock、AON IRQ、DDC依存を確認後に実装。
+5. VC5 masterがproviderを集約し、component framework相当のbind/unbind/rollbackを担当。
+6. 全providerのresource取得後にDRM/KMS objectを生成し、失敗時は逆順rollback。
+
+現時点でCFATTACHコードは追加していない。runtime DTBの完全採取とPCIe host attach問題の調査前にHDMI/KMSまで一括実装しない。初回コード変更はHVS/PV resource-only attachに限定し、既存 `vc4_fdt` との二重所有を避ける。
+
+### 10.30.7 次の作業と未解決事項
+
+| 優先度 | 項目 | 現状 | 次の確認 |
+|---|---|---|---|
+| P0 | DTB起動時PCIe host | not configured。driver source/config entryあり | kernel config/revision、runtime node、match |
+| P0 | DTB起動の操作経路 | USB-A keyboard不可 | serial console |
+| P1 | VL805 enumeration | DTB起動で未確認 | PCIe attach後のvendor/device ID |
+| P1 | runtime DTB | dmesg列挙のみ | serialから `ofctl -pv` |
+| P1 | VC5 resource map | source DTSあり | runtime status/reg/IRQ/clock/reset/graph |
+| P2 | HVS/PV CFATTACH | 未実装 | resource-only skeleton |
+| P2 | HDMI CFATTACH | 未実装 | DVP/DDC/IRQ/clock/reset依存 |
+
+### 10.30.8 参照ソース
+
+- NetBSD EFI FDT: [efifdt.c](https://github.com/ebijun/src/blob/vc4-drmkms/sys/stand/efiboot/efifdt.c)
+- NetBSD EFI ACPI: [efiacpi.c](https://github.com/ebijun/src/blob/vc4-drmkms/sys/stand/efiboot/efiacpi.c)
+- NetBSD PCIe host: [bcm2838_pcie.c](https://github.com/ebijun/src/blob/vc4-drmkms/sys/arch/arm/broadcom/bcm2838_pcie.c)
+- PCIe registers: [bcm2838_pcie.h](https://github.com/ebijun/src/blob/vc4-drmkms/sys/arch/arm/broadcom/bcm2838_pcie.h)
+- Device registration: [files.bcm2835](https://github.com/ebijun/src/blob/vc4-drmkms/sys/arch/arm/broadcom/files.bcm2835)
+- BCM2711 DTS: [bcm2711.dtsi](https://github.com/ebijun/src/blob/vc4-drmkms/sys/external/gpl2/dts/dist/arch/arm/boot/dts/broadcom/bcm2711.dtsi)
+- RPi4 board DTS: [bcm2711-rpi-4-b.dts](https://github.com/ebijun/src/blob/vc4-drmkms/sys/external/gpl2/dts/dist/arch/arm/boot/dts/broadcom/bcm2711-rpi-4-b.dts)
+- EDK2 xHCI SSDT: [Xhci.asl](https://github.com/tianocore/edk2-platforms/blob/master/Platform/RaspberryPi/AcpiTables/Xhci.asl)
+
+本節は調査結果と設計計画の追記であり、kernel、EFI bootloader、PFTF firmware、DTB、config.txtの変更は行っていない。GitHub Actionsおよび追加の実機boot testは未実施。
