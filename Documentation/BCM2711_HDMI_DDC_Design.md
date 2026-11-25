@@ -4945,3 +4945,32 @@ CIで確認するのはGENERIC64のconfig生成、tools構築、kernel cross com
 DTB起動ではUSB keyboardを失う可能性があるため、実機検証はシリアルコンソール等の代替入力・出力経路を確保して行う。
 
 本節記載時点では、aarch64 CI workflowを更新したが、その更新後定義によるGENERIC64 build結果は未確認である。
+
+## 10.33 CIを独立job化しaarch64 GENERIC64を単独検証する
+
+### 背景
+
+従来の `.github/workflows/kernel-build.yml` は、`earmv7hf/GENERIC` と
+`aarch64/GENERIC64` を単一job内の逐次stepとして実行していた。
+このためearmv7hfのビルド失敗で後続のGENERIC64ビルドが実行されず、
+aarch64側の成否を独立して確認できなかった。
+
+### 変更
+
+workflowを次の独立jobに分割した。
+
+- `build-earmv7hf`: earmv7hf用toolsとGENERICカーネルをビルドする。
+- `build-aarch64`: aarch64用toolsとGENERIC64カーネルをビルドする。
+
+両jobはcheckoutと依存パッケージ導入をそれぞれ実行し、job間に
+`needs`依存を持たない。従って一方の失敗は他方の開始を妨げない。
+aarch64 jobは `obj-aarch64` / `tools-aarch64` を使用し、
+`netbsd-kernel-aarch64-GENERIC64` artifactをアップロードする。
+`if-no-files-found: error` により、カーネル成果物がない場合は成功扱いにしない。
+
+### 検証上の注意
+
+job分離はGENERIC64のビルド実行をearmv7hfから独立させる変更であり、
+GENERIC64のコンパイル成功を事前に保証するものではない。push後のActionsで
+aarch64 jobのtools作成、kernelビルド、artifact uploadがすべて成功したことを
+確認して初めて、単独ビルド成功と判定する。
