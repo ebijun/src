@@ -2497,3 +2497,327 @@ NetBSDの通常のdevice driverは、Linuxのplatform busへ動的にdriverを�
 - component frameworkを汎用Linux-KPIとして実装する必要がある他のNetBSD DRM driverの有無。
 
 本節の追記時点では、component framework、platform driver登録API、VC4 master orchestrationのCコード変更は行っていない。次の実装は、NetBSD autoconfiguration側のVC4 attach構造を確認してから開始する。
+
+
+
+### 10.22 VC4各subdriverの構造・attach依存関係調査
+
+2026-11-25時点の `vc4-drmkms` branchにあるVC4ソースを調査し、`vc4_drv.c` が列挙する各subdriverの役割、probe/bind/unbind/removeの分担、NetBSD移植上の依存関係を整理する。
+
+調査対象は次のファイルである。
+
+- `sys/external/bsd/drm2/dist/drm/vc4/vc4_drv.c`
+- `sys/external/bsd/drm2/dist/drm/vc4/vc4_drv.h`
+- `sys/external/bsd/drm2/dist/drm/vc4/vc4_hdmi.c`
+- `sys/external/bsd/drm2/dist/drm/vc4/vc4_hvs.c`
+- `sys/external/bsd/drm2/dist/drm/vc4/vc4_crtc.c`
+- `sys/external/bsd/drm2/dist/drm/vc4/vc4_v3d.c`
+
+このbranchで上記の場所から取得できなかったファイル:
+
+- `vc4_vec.c`
+- `vc4_dpi.c`
+- `vc4_dsi.c`
+- `vc4_txp.c`
+
+この4ファイルについては、Linux upstream等の別ソースの実装をNetBSD branchの実装であるかのように扱わない。以下では、branch内の登録リスト・ヘッダー宣言から確認できる範囲と、実装未確認事項を分離する。
+
+#### 10.22.1 VC4 subdriver一覧とソース確認状況
+
+現行 `vc4_drv.c` の `component_drivers[]` は次の8 driverを登録対象としている。
+
+| 登録順 | driver | branch内のCソース | component登録を確認 | 調査結果 |
+|---:|---|---|---|---|
+| 1 | `vc4_hdmi_driver` | `vc4_hdmi.c` | 確認 | HDMI encoder/connector、DDC、clock、HPD、CEC/audio条件部 |
+| 2 | `vc4_vec_driver` | 未取得 (`vc4_vec.c` が404) | 未確認 | `vc4_drv.h` にextern宣言、登録リストに存在 |
+| 3 | `vc4_dpi_driver` | 未取得 (`vc4_dpi.c` が404) | 未確認 | `vc4_drv.h` にextern宣言、登録リストに存在 |
+| 4 | `vc4_dsi_driver` | 未取得 (`vc4_dsi.c` が404) | 未確認 | `vc4_drv.h` にextern宣言、登録リストに存在 |
+| 5 | `vc4_txp_driver` | 未取得 (`vc4_txp.c` が404) | 未確認 | `vc4_drv.h` にextern宣言、登録リストに存在 |
+| 6 | `vc4_hvs_driver` | `vc4_hvs.c` | 確認 | HVS display list、LBM、underrun IRQ |
+| 7 | `vc4_crtc_driver` | `vc4_crtc.c` | 確認 | PixelValve、CRTC、plane、vblank/IRQ |
+| 8 | `vc4_v3d_driver` | `vc4_v3d.c` | 確認 | V3D 3D engine、clock、IRQ、runtime PM |
+
+`vc4_drv.h` には次のextern宣言がある。
+
+- `vc4_crtc_driver`
+- `vc4_dpi_driver`
+- `vc4_dsi_driver`
+- `vc4_hdmi_driver`
+- `vc4_vec_driver`
+- `vc4_txp_driver`
+- `vc4_hvs_driver`
+- `vc4_v3d_driver`
+
+`vc4_drv.h` の `struct vc4_dev` には `hdmi`、`hvs`、`v3d`、`dpi`、`dsi1`、`vec`、`txp` の各subsystem pointerがある。CRTCは `struct vc4_crtc` としてDRM CRTC側に保持され、上記の `vc4_dev` メンバーとは別に管理される。
+
+重要: `component_drivers[]` に登録名があること、ヘッダーにextern宣言があることは、対応する実装ソースがbranchに存在することや、NetBSD attachが実装済みであることを意味しない。VEC/DPI/DSI/TXPはソースを取得できていないため、probe/bind処理・resource・IRQ・clock・FDT依存は未確認とする。
+
+#### 10.22.2 subdriver共通のprobe/bind分離
+
+取得できたHDMI/HVS/CRTC/V3Dの4ファイルでは、subdriverのplatform probeは共通して次の形を取る。
+
+```c
+static int
+vc4_xxx_dev_probe(struct platform_device *pdev)
+{
+        return component_add(&pdev->dev, &vc4_xxx_ops);
+}
+```
+
+remove側は対応する `component_del()` を呼ぶ。実際のhardware初期化は `component_ops.bind` から実行される。
+
+この構造は次の2段階である。
+
+1. platform driverのprobe/remove: component frameworkへ参加・離脱する。
+2. component bind/unbind: master DRM deviceに属するhardware blockを初期化・停止する。
+
+従って、NetBSD側でsubdriverのattachを実装する場合、単純にLinuxの `probe()` をNetBSD attachへ置き換えるだけでは不十分である。component登録が担っていた「masterがsubdriverを発見できる状態」と、bindが担っていた「master DRM deviceに対するhardware初期化」をどのNetBSD attach/softc関係で表現するかを定義する必要がある。
+
+#### 10.22.3 HDMI subdriver — `vc4_hdmi.c`
+
+確認できたdriver:
+
+- driver name: `vc4_hdmi`
+- match compatible: `brcm,bcm2835-hdmi`
+- probe: `vc4_hdmi_dev_probe()` → `component_add()`
+- remove: `vc4_hdmi_dev_remove()` → `component_del()`
+- master bind: `vc4_hdmi_bind()`
+- master unbind: `vc4_hdmi_unbind()`
+
+bind処理の主な内容:
+
+1. `struct vc4_hdmi` とencoder用構造体を `devm_kzalloc()` で確保する。
+2. `to_platform_device()` でplatform deviceを得て、`hdmi->pdev` に保存する。
+3. resource index 0/1を `vc4_ioremap_regs()` でmapする。
+4. `pixel` / `hdmi` clockを取得する。
+5. device treeの `ddc` phandleを解決し、I2C adapterを取得する。
+6. HSM clock rate設定とenableを行う。
+7. `hpd-gpios` propertyがあればHPD GPIOとactive-low flagを取得する。
+8. HDMI coreを有効化し、runtime PMをenableする。
+9. DRM encoder/connectorを初期化する。
+10. 条件付きでCEC adapter/IRQを初期化する。
+11. 条件付きでHDMI audioを初期化する。
+12. debugfs情報を登録する。
+
+unbind処理はCEC adapterのunregister、connector/encoderのdestroy、clock disable、runtime PM disable、DDC adapter device参照の解放、`vc4->hdmi = NULL` を行う。
+
+NetBSD移植上の依存:
+
+- OF node: `dev->of_node`、`of_parse_phandle()`、`of_node_put()`、`of_find_property()`。
+- I2C: `of_find_i2c_adapter_by_node()` と `struct i2c_adapter` の寿命管理。
+- GPIO: `of_get_named_gpio_flags()` と `OF_GPIO_ACTIVE_LOW`。
+- clock: `devm_clk_get()`、`clk_set_rate()`、`clk_prepare_enable()`、`clk_disable_unprepare()`。
+- PM: `pm_runtime_enable()` / `pm_runtime_disable()`。
+- IRQ: CEC有効時の `platform_get_irq()` / `devm_request_threaded_irq()`。
+- CEC/audio: CONFIG条件に応じた依存と構造体メンバーの整合。
+
+NetBSDでは、FDT nodeは既定の `struct device_node *` として扱わず、10.18〜10.20節の `platform_device_of_node()` が返すNetBSD OF node値とNetBSD FDT APIへ置換する。DDC adapter、GPIO、clock、PMはnode取得helperとは別のbridge課題である。CEC/audioは本体のcomponent bindを成立させるための必須条件と混同せず、構成条件を独立して整理する。
+
+#### 10.22.4 HVS subdriver — `vc4_hvs.c`
+
+確認できたdriver:
+
+- driver name: `vc4_hvs`
+- match compatible: `brcm,bcm2835-hvs`
+- probe/remove: component add/del
+- bind/unbind: `vc4_hvs_bind()` / `vc4_hvs_unbind()`
+
+bind処理の主な内容:
+
+1. `struct vc4_hvs` を確保し、`hvs->pdev` にplatform deviceを保存する。
+2. resource index 0をMMIO mapし、register setを設定する。
+3. `hvs->dlist` をHVS register baseと `SCALER_DLIST_START` から設定する。
+4. memory manager lockを初期化する。
+5. bootloaderが利用中のdisplay list領域を避けてdisplay-list用 `drm_mm` を初期化する。
+6. LBM用 `drm_mm` を初期化する。
+7. Mitchell-Netravali filter kernelをuploadする。
+8. `vc4->hvs` にHVSを登録する。
+9. HVS display control/interrupt設定を行う。
+10. `platform_get_irq()` と `devm_request_irq()` でunderrun IRQを登録する。
+11. debugfs register/underrun情報を登録する。
+
+unbind処理はfilter kernelのallocationを解放し、display-list/LBMのmemory managerを終了し、`vc4->hvs = NULL` とする。
+
+NetBSD移植上の依存:
+
+- MMIO resource index 0の取得とmap。
+- HVS IRQのNetBSD interrupt establishment。
+- `drm_mm` の初期化・解放と、bind失敗途中のrollback。
+- `hvs->dlist` の型は `u32 __iomem *`。MMIO baseからのoffset計算はbyte offsetとdword pointerの単位を区別する。
+- debugfsの `seq_file` は `m->private` を参照するため、NetBSD側で完全型定義が必要。
+
+HVSはdisplay pipelineの共有資源であり、CRTC bindより前に初期化されていなければCRTC側のHVS channel利用を成立させられない。現行 `component_drivers[]` の配列順はHDMI/VEC/DPI/DSI/TXP/HVS/CRTC/V3Dであり、HVSはCRTCより前に置かれている。
+
+#### 10.22.5 CRTC / PixelValve subdriver — `vc4_crtc.c`
+
+確認できたdriver:
+
+- driver name: `vc4_crtc`
+- match compatible:
+  - `brcm,bcm2835-pixelvalve0`
+  - `brcm,bcm2835-pixelvalve1`
+  - `brcm,bcm2835-pixelvalve2`
+- probe/remove: component add/del
+- bind/unbind: `vc4_crtc_bind()` / `vc4_crtc_unbind()`
+
+各PixelValveのmatch dataはHVS channelと接続可能encoder typeを定義する。
+
+| PixelValve compatible | HVS channel | encoder type |
+|---|---:|---|
+| pixelvalve0 | 0 | DSI0、DPI |
+| pixelvalve1 | 2 | DSI1、SMI |
+| pixelvalve2 | 1 | HDMI、VEC |
+
+bind処理の主な内容:
+
+1. `struct vc4_crtc` を確保する。
+2. `of_match_device()` でPixelValve match dataを取得する。
+3. resource index 0をMMIO mapする。
+4. register setを設定する。
+5. primary planeを作成し、DRM CRTCを初期化する。
+6. gamma/color managementを設定する。
+7. overlay planeを最大8個作成する。
+8. cursor planeを作成する。
+9. HVS display base registerからCOB allocation sizeを取得する。
+10. PixelValve interruptを設定し、IRQを登録する。
+11. encoder/CRTCのpossible maskを設定する。
+12. LUTを初期化し、drvdata/debugfsを設定する。
+
+unbind処理はDRM CRTCをdestroyし、PixelValve interruptをdisableし、platform drvdataをNULLにする。
+
+NetBSD移植上の依存:
+
+- FDT compatibleからPixelValveごとのmatch dataを選択する仕組み。
+- MMIO resource index 0とIRQ。
+- HVSのchannel/COB registerへの依存。
+- DRM plane/CRTCの生成・破棄順序。
+- encoder typeとpossible_crtcsの対応。
+- bind途中でplane/CRTC/IRQの初期化に失敗した場合のrollback。
+
+CRTCの初期化はHVSの状態を参照する。従ってNetBSD側のorchestrationでは、HVSを先にattach/bind可能にするか、CRTC bindがHVSの準備完了を検査して延期できる設計が必要である。
+
+#### 10.22.6 V3D subdriver — `vc4_v3d.c`
+
+確認できたdriver:
+
+- driver name: `vc4_v3d`
+- match compatible:
+  - `brcm,bcm2835-v3d`
+  - `brcm,cygnus-v3d`
+  - `brcm,vc4-v3d`
+- probe/remove: component add/del
+- bind/unbind: `vc4_v3d_bind()` / `vc4_v3d_unbind()`
+- driver PM ops: runtime suspend/resume
+
+bind処理の主な内容:
+
+1. `struct vc4_v3d` を確保し、drvdataへ設定する。
+2. platform deviceを保存する。
+3. resource index 0をMMIO mapし、register setを設定する。
+4. `vc4->v3d` と `v3d->vc4` を接続する。
+5. V3D clockを取得する。bcm2835でclock propertyがない場合はNULLとして扱う。
+6. V3D IDENT0を確認する。
+7. clockをenableする。
+8. binner overflow address/size registerを初期化する。
+9. V3D hardwareを初期化する。
+10. IRQをinstallする。
+11. runtime PMをactive/use-autosuspend設定し、enableする。
+12. debugfs情報を登録する。
+
+unbind処理はruntime PMをdisableし、DRM IRQをuninstallし、binner overflow address/sizeをclearし、`vc4->v3d = NULL` とする。
+
+NetBSD移植上の依存:
+
+- MMIO resource index 0。
+- optional clockとclock enable/disable。
+- V3D IRQとDRM IRQ管理。
+- runtime PM/autosuspendの代替または明示的な未対応方針。
+- IDENT0によるhardware識別。
+- bind失敗時に既にenableしたclockやIRQを戻す処理。
+
+V3Dはrender nodeの有無にも関係する。現行 `vc4_drm_bind()` は `vc4_v3d_dt_match` でV3D nodeの有無・availabilityを確認し、V3Dがない場合は `DRIVER_RENDER` を無効にする。NetBSD移植時にはこの判定をLinux OF node pointerに依存させず、NetBSD FDT APIで表現する必要がある。
+
+#### 10.22.7 VEC / DPI / DSI / TXPの現状と調査課題
+
+このbranchでは対応するCソースを取得できなかったため、各subdriverのbind/unbindの処理内容を確定できない。確認できる範囲は以下に限られる。
+
+| subdriver | 確認できた情報 | 未確認事項 |
+|---|---|---|
+| VEC | `vc4_drv.c` のcomponent driver list、`vc4_drv.h` のextern `vc4_vec_driver`、`vc4_dev.vec` pointer、CRTC pixelvalve2のencoder type | compatible、resource/clock/IRQ、bind/unbind、VEC register初期化 |
+| DPI | driver list、extern `vc4_dpi_driver`、`vc4_dev.dpi` pointer、CRTC pixelvalve0のencoder type | compatible、resource/clock/bridge、bind/unbind、panel接続 |
+| DSI | driver list、extern `vc4_dsi_driver`、`vc4_dev.dsi1` pointer、CRTC pixelvalve0/1のDSI encoder type | DSI0/DSI1のdevice構成、compatible、resource/clock/PHY、IRQ、bind/unbind |
+| TXP | driver list、extern `vc4_txp_driver`、`vc4_dev.txp` pointer、CRTC stateの `feed_txp` / `txp_armed`、pixelvalve1のHVS channel 2がvirtual encoderを許可する処理 | compatible、resource/IRQ、TXP bind順、TXPとCRTCの実際の連携処理 |
+
+次の実装段階に進む前に、これら4ファイルのソースをbranchへ取り込むか、対象branchでの実装方針（機能を移植するか、対象機能を明示的に無効化するか）を決める必要がある。ソースがないまま `component_add()` のcallbackやresourceを推定して実装してはならない。
+
+#### 10.22.8 VC4 master bindの依存関係
+
+現行branchの `component_drivers[]` 順序は次のとおりである。
+
+```c
+static struct platform_driver *const component_drivers[] = {
+        &vc4_hdmi_driver,
+        &vc4_vec_driver,
+        &vc4_dpi_driver,
+        &vc4_dsi_driver,
+        &vc4_txp_driver,
+        &vc4_hvs_driver,
+        &vc4_crtc_driver,
+        &vc4_v3d_driver,
+};
+```
+
+このbranchの配列順は事実として記録する。ただし、取得できたこのbranchの `vc4_drv.c` には配列順の理由を説明するコメントがない。従って、配列順がcomponent bind callbackの実行順を保証するか、また各subdriver間の依存を完全に満たすかは、component frameworkの実装とVC4各callbackを併せて検証する必要がある。
+
+ソースから直接確認できる依存は次のとおり。
+
+1. CRTC bindはHVS register（COB allocation等）を読むため、HVSが利用可能である必要がある。
+2. CRTCはHVS channel番号をPixelValve match dataから得る。
+3. CRTCのpossible maskはDRM encoder一覧を走査して設定するため、HDMI/VEC/DPI/DSI/TXP等のencoderを生成するcomponentとの順序関係がある。
+4. HDMI bindはDDC I2C adapter、clock、必要ならGPIOを取得し、connectorを生成する。
+5. V3Dが存在しない場合はmaster側のDRIVER_RENDER capabilityを無効にする。
+6. master bindは `component_bind_all()` の後にKMS loadとDRM registerを行う。subdriverの一部でもbindに失敗すれば、master bind全体を成功扱いにできない。
+
+NetBSD側では、単純に配列順をコピーするのではなく、各subdriverが生成するDRM objectと他blockが参照する資源を列挙し、依存グラフを作成する。特にencoder生成とCRTC possible mask設定の順序を明示する。
+
+#### 10.22.9 NetBSD autoconfigurationへ移す際の責務分割案
+
+現時点での実装済みコードではなく、調査結果から導いた設計案である。
+
+| Linux側責務 | NetBSD側で必要な責務 |
+|---|---|
+| platform driver登録 | VC4関連deviceのCFATTACH/親bus attach経路を定義 |
+| platform driver probe | 各FDT node/deviceのmatchとsoftc確保 |
+| component_add | attach済みsubdriverをVC4 masterが参照できる登録・関連付け |
+| component_match_add | FDT node/compatible/親device等に基づくsubdriver集合の決定 |
+| component_master_add_with_match | master attachと必要component集合の成立管理 |
+| component_bind_all | DRM deviceを渡してsubdriverのhardware/DRM objectを初期化 |
+| component_unbind_all | 成功済みsubdriverを逆順に停止・解放 |
+| component_del | subdriver detach時にmasterとの関連を解除 |
+| devm_* | NetBSDの資源取得・解放とattach失敗時のcleanup |
+
+この表はAPIの一対一置換を意味しない。NetBSDのdevice_tとsoftcの寿命、親子関係、detach順序、資源管理を前提に責務を再配置する必要がある。
+
+#### 10.22.10 次の調査・実装順序
+
+1. VEC/DPI/DSI/TXPのソースが対象branchに存在するかをGit treeとMakefileから確認し、欠落なら取り込み元・対象commitを特定する。
+2. 各subdriverのFDT compatibleとNetBSD側device nodeを対応づける。
+3. HDMI/HVS/CRTC/V3Dの各resource、clock、IRQ、FDT、DRM object依存を表にし、bind失敗時のcleanupも確認する。
+4. CRTCのencoder possible mask設定が依存するencoder生成順序を確定する。
+5. HVS→CRTC、encoder→CRTC mask、V3D optional/render capabilityの依存を含むVC4 attach graphを作成する。
+6. NetBSD側のmaster attach起点とsubdriver softcの所有者を決める。
+7. attach済みcomponent集合の成立条件、bind順、rollback、detach逆順を実装する。
+8. component orchestrationが確定してから、各subdriverのLinux resource/clock/IRQ/OF/PM APIをNetBSD native APIへ置き換える。
+
+#### 10.22.11 調査結果のまとめ
+
+- 現行 `vc4_drv.c` は8個のsubdriverをcomponentとして集約する構造である。
+- branch内でbind/unbind実装まで確認できたのはHDMI、HVS、CRTC、V3Dの4つである。
+- これら4つはいずれもplatform probeでcomponent登録し、master bindでhardware/DRM初期化を行う。
+- CRTCはHVSとencoder集合に依存し、HVSはdisplay-list/LBM/underrun IRQを管理する。
+- HDMIはDDC I2C、clock、HPD GPIO、CEC/audio条件部に依存する。
+- V3Dはoptional clock、IRQ、runtime PMを持ち、master側のrender capability判定にも関係する。
+- VEC/DPI/DSI/TXPは登録リストとヘッダー宣言を確認したが、branch内のCソースが取得できず、実装詳細は未確定である。
+- Linux component frameworkのbind順をNetBSD側へ機械的に移すのではなく、NetBSD attach graphとして依存を明示する必要がある。
+
+本節の追記時点では、VC4 subdriverのCソース変更、NetBSD CFATTACH追加、component framework実装は行っていない。ソース未確認の4 driverについては、実装推測を避け、ソース確保後に本節を更新する。
