@@ -2315,3 +2315,185 @@ helperは `platform_device` 定義の後に置く。これにより `pdev->pd_de
 5. DDC I2C bridgeおよびHPD GPIO bridgeの未実装部分を、このhelperの完了と混同しない。
 
 本節は実装仕様であり、コードの適用やActionsによる検証結果を示すものではない。
+
+
+
+### 10.21 Linux-KPI component framework と platform driver 登録APIの調査
+
+2026-11-25時点の `vc4-drmkms` branchについて、VC4のprobe/bind経路で使用するLinux component frameworkとplatform driver登録APIを調査した。本節はGitHub上の対象branchのヘッダー・VC4ソース、およびLinux upstreamのAPI仕様を照合した結果である。NetBSDカーネルのビルドや実機attachを実行した結果ではない。
+
+#### 10.21.1 調査対象
+
+対象ファイル:
+
+- `sys/external/bsd/drm2/include/linux/component.h`
+- `sys/external/bsd/drm2/include/linux/platform_device.h`
+- `sys/external/bsd/drm2/include/linux/device.h`
+- `sys/external/bsd/drm2/include/linux/of_platform.h`
+- `sys/external/bsd/drm2/include/linux/module.h`
+- `sys/external/bsd/drm2/dist/drm/vc4/vc4_drv.c`
+
+関連するLinux upstream資料:
+
+- [Linux Component Helper for Aggregate Drivers](https://www.kernel.org/doc/html/latest/driver-api/component.html)
+- [Linux drivers/base/component.c](https://github.com/torvalds/linux/blob/master/drivers/base/component.c)
+
+#### 10.21.2 Linux component frameworkの役割
+
+Linux component frameworkは、複数の独立したdevice driverを1つのaggregate driverとして組み立てるための仕組みである。VC4ではHDMI、VEC、DPI、DSI、TXP、HVS、CRTC、V3D等を個別のplatform driverとして登録し、VC4 master側で必要なcomponentを照合してからDRM deviceをbindする。
+
+主要APIの役割は次のとおり。
+
+| API / 型 | Linuxでの役割 |
+|---|---|
+| `struct component_ops` | 個別componentの `bind` / `unbind` callback |
+| `component_add()` | component deviceをframeworkへ登録 |
+| `component_del()` | component登録を解除。bind済みならaggregate側のunbindを発生させる |
+| `struct component_master_ops` | aggregate/master側の `bind` / `unbind` callback |
+| `component_match_add()` | masterが必要とするcomponentの照合条件を登録 |
+| `component_master_add_with_match()` | match条件とmaster callbackを登録し、必要なcomponentが揃えばmaster bindを実行 |
+| `component_bind_all()` | match順にcomponentのbind callbackを呼び出す |
+| `component_unbind_all()` | bind済みcomponentをunbindする |
+| `component_master_del()` | master登録を解除し、必要ならunbindする |
+
+Linuxの `component_master_add_with_match()` は、match listに登録されたcomponentがすべて利用可能になった時点でmasterの `bind` を呼ぶ。単なるdevice検索やcallbackの直接呼び出しではなく、componentの追加・削除とaggregateの成立・解体を管理するframeworkである。
+
+#### 10.21.3 NetBSD Linux-KPI component.hの現状
+
+現行 `sys/external/bsd/drm2/include/linux/component.h` には、次の定義がある。
+
+- `struct component_ops` のcallback引数はLinuxの `struct device *` ではなくNetBSDの `device_t`。
+- `component_add()` は引数を利用せず、常に0を返す。
+- `component_del()` は空関数。
+- `struct component_master_ops` は定義されていない。
+- `struct component_match` およびmatch list管理APIは定義されていない。
+- `component_match_add()`、`component_master_add_with_match()`、`component_master_del()`、`component_bind_all()`、`component_unbind_all()` は実装されていない。
+
+現行実装の本質は次のとおりである。
+
+```c
+struct component_ops {
+        int (*bind)(device_t dev, device_t master, void *data);
+        void (*unbind)(device_t dev, device_t master, void *data);
+};
+
+static inline int
+component_add(struct device *dev, const struct component_ops *ops)
+{
+        return 0;
+}
+
+static inline void
+component_del(struct device *dev, const struct component_ops *ops)
+{
+}
+```
+
+したがって、現状の `component_add()` が0を返してもcomponentが登録されたことにはならない。componentの一覧、照合、bind/unbind、detach時の連鎖処理はいずれも存在しない。callback引数の型もLinux upstream ABIとは異なるため、Linux側の関数をそのまま呼べる実装ではない。
+
+このno-opをVC4で利用すると、エラーを返さずにcomponent登録が成功したように見える一方、master側からcomponentを発見・bindできない。API宣言の追加やno-opのままのビルドエラー回避を、機能実装として扱ってはならない。
+
+#### 10.21.4 NetBSD platform_device.hの現状
+
+現行 `sys/external/bsd/drm2/include/linux/platform_device.h` で確認できた構成は次のとおり。
+
+- `struct platform_device` はNetBSD実deviceの `device_t pd_dev` とLinux-KPI側の `struct device dev` を保持する。
+- `struct platform_driver` は `probe`、`remove` と、`driver.name`、`driver.of_match_table` の最小定義である。
+- `platform_get_resource()` は常にNULLを返す。
+- `devm_ioremap_resource()` は常にNULLを返す。
+- `devm_request_irq()` は常に0を返す。
+- `platform_get_irq()` は引数の `num` をそのまま返す。
+- `platform_get_drvdata()` / `platform_set_drvdata()` は `device_private(pdev->pd_dev)` / `device_set_private()` を使用する。
+- `to_platform_device(device_t)` は `device_private()` を返すXXX実装である。
+
+一方、次の登録・検索APIはこのヘッダーに存在しない。
+
+- `platform_driver_register()`
+- `platform_driver_unregister()`
+- `platform_register_drivers()`
+- `platform_unregister_drivers()`
+- `platform_find_device_by_driver()`
+
+従って、platform driverの登録・照合・probe/removeを管理する実装は、現行ヘッダーからは確認できない。resource、ioremap、IRQ helperも現状は実資源を取得する実装ではないため、これらのstubを使ってVC4のattachが成立すると仮定してはならない。
+
+#### 10.21.5 device構造とNetBSD device_tの境界
+
+現行 `linux/device.h` の `struct device` は `device_t bsdev` のみを持つ最小構造である。一方、`struct platform_device` は別メンバーとして `device_t pd_dev` を持つ。
+
+VC4の `vc4_drv.c` はLinuxのdevice pointerを前提に、次の処理を行う。
+
+1. `platform_find_device_by_driver()` で各platform driverに対応するdeviceを検索する。
+2. `component_match_add()` に比較関数 `compare_dev()` とdevice pointerを渡す。
+3. master bindで `to_platform_device()` を使い、platform deviceを得る。
+4. `component_bind_all()` で各subdriverをbindする。
+5. master unbind/removeで `component_unbind_all()` と `component_master_del()` を呼ぶ。
+
+しかし、NetBSD側では `struct device` と `device_t` は同じ型ではない。比較関数のpointer identity、`dev->bsdev` と `pdev->pd_dev` の対応、`device_private()` が返すsoftcの型、device参照寿命を定義せずにLinuxコードの比較・変換を移植することはできない。
+
+特に `to_platform_device()` の現行実装は `device_private(self)` を無条件に返す。対象deviceのsoftcが `struct platform_device` であることを保証する登録経路は、今回確認したヘッダーからは確認できなかった。この関数を安全な一般変換として扱わない。
+
+#### 10.21.6 VC4 master/subdriver構成との対応
+
+現行 `vc4_drv.c` では `component_drivers[]` に以下のdriverを列挙している。
+
+- `vc4_hdmi_driver`
+- `vc4_vec_driver`
+- `vc4_dpi_driver`
+- `vc4_dsi_driver`
+- `vc4_txp_driver`
+- `vc4_hvs_driver`
+- `vc4_crtc_driver`
+- `vc4_v3d_driver`
+
+`vc4_platform_drm_probe()` はこれらを `vc4_match_add_drivers()` へ渡し、見つかったdeviceをmatch listへ登録してから `component_master_add_with_match()` を呼ぶ。master bindはDRM deviceを確保し、`component_bind_all()` でsubdriverをbindした後、KMSとDRM deviceを登録する。失敗時には `component_unbind_all()` を通じて既にbindしたcomponentを戻す。remove側は `component_master_del()` を呼ぶ。
+
+この順序はVC4の表示パイプラインを一体として初期化するためのものであり、単に各subdriverのprobeを呼び出すだけでは同じ意味にならない。必要なsubdriverの欠落、attach順序、途中失敗時のrollback、detach時の逆順処理を考慮する必要がある。
+
+#### 10.21.7 platform driver登録とNetBSD autoconfigurationの違い
+
+Linuxの `platform_driver_register()` / `platform_register_drivers()` は、platform busへdriverを登録し、既に存在するdeviceまたは後から追加されたdeviceとのmatchを通じてprobe/removeを管理するAPIである。VC4の `module_init()` / `module_exit()` はこの登録・解除を行う入口になっている。
+
+NetBSDの通常のdevice driverは、Linuxのplatform busへ動的にdriverを登録する方式ではなく、カーネルのautoconfigurationにdriver attachmentを組み込む。FDT対応driverでは、driverごとのmatch/attachと `CFATTACH_DECL_NEW()`、構成ファイルのsource登録、親busからのattachが基本となる。したがってLinuxの登録関数名をNetBSD側に追加するだけでは、NetBSD autoconfigurationとの接続は得られない。
+
+また現行 `linux/module.h` では `module_init()` と `module_exit()` は空マクロである。このため、VC4の `vc4_drm_register()` / `vc4_drm_unregister()` を定義しただけでは呼び出されない。NetBSD側では、どのCFATTACHまたは既存DRM2初期化経路からVC4 master/subdriverの初期化を開始するかを明示する必要がある。
+
+#### 10.21.8 設計方針の比較
+
+| 方針 | 内容 | 評価・課題 |
+|---|---|---|
+| A. Linux component frameworkをLinux-KPIに実装 | component list、match list、master管理、bind/unbind、ロック、寿命管理を実装し、device_tとの変換も定義 | Linuxの構造に近いが、単なるstub拡張ではなくframework移植となる。参照寿命、detach、lock順序、callback再入を含む大きな作業 |
+| B. NetBSD autoconfigurationにVC4 orchestrationを実装 | NetBSDの親device/softcをmasterとし、attach済みsubdriverを明示的に集約する。VC4のbind/unbind順序とrollbackをNetBSD側で管理 | NetBSDのdevice modelに沿う。Linux component APIの汎用互換実装を避けられるが、VC4のsubdriver attach構成と依存関係を先に確定する必要がある |
+| C. component APIを成功stubのまま使う | 現状のno-opを維持し、呼び出し側だけコンパイルさせる | componentが登録・bindされず、VC4 masterが必要なsubdriverを組み立てられないため不可 |
+
+現時点では方針Bを第一候補とする。ただし、各VC4 subdriverのNetBSD側attach構造、softc、FDT親子関係、既存のDRM2登録経路を調査してから最終決定する。方針Aを選ぶ場合も、Linux ABIの関数名だけを追加するのではなく、Linux component frameworkの状態遷移とNetBSD device_tの所有権を実装する必要がある。
+
+#### 10.21.9 次の調査・実装順序
+
+1. VC4各subdriverの `platform_driver` 定義、probe/remove、`component_add()` 呼び出しの有無を一覧化する。
+2. 各subdriverがNetBSDでどの `device_t` / softc / FDT nodeに対応するかを確認する。
+3. `vc4_platform_drm_probe()` に相当するmaster attachの起点を、NetBSDのCFATTACHおよびDRM2登録経路から特定する。
+4. master bindで必要なsubdriver集合、bind順、rollback、unbind順を確定する。
+5. `platform_get_resource()`、`devm_ioremap_resource()`、IRQ、drvdata helperのstubを個別に実装またはNetBSD native APIへ置換する。
+6. `module_init()` に依存する登録経路をNetBSD autoconfigurationへ移す。空のmodule macroを呼び出し機構として利用しない。
+7. その後に `vc4_drv.c` のLinux component masterコードをNetBSD向けに置き換え、Actionsで対象オブジェクトのコンパイルとリンクを確認する。
+
+この作業では、`component.h` に不足関数のprototypeだけを追加する修正、`platform_driver_register()` を成功値だけ返すstubとして追加する修正、`device_t` と `struct device *` の無条件castは行わない。
+
+#### 10.21.10 現時点の結論と未確認事項
+
+確認できたこと:
+
+- NetBSD Linux-KPI `component.h` は現状no-opであり、Linux component frameworkのaggregate管理を実装していない。
+- `component_master_ops`、match管理、master登録・解除、bind/unbind APIは現行ヘッダーにない。
+- `platform_device.h` はplatform device/driverの最小構造と複数のstubを持つが、driver登録・解除・検索APIはない。
+- `module_init()` / `module_exit()` は現行 `module.h` で空マクロであり、Linuxの登録関数を自動実行しない。
+- VC4のmaster/subdriver構成は、component frameworkの成立を前提にしている。
+
+未確認事項:
+
+- 各VC4 subdriverのNetBSD側attach経路と、実際の `device_t` / softc配置。
+- `to_platform_device()` が想定するsoftc配置を満たす既存生成経路の有無。
+- VC4 masterのNetBSD側attach起点と、既存DRM2初期化との接続方法。
+- component frameworkを汎用Linux-KPIとして実装する必要がある他のNetBSD DRM driverの有無。
+
+本節の追記時点では、component framework、platform driver登録API、VC4 master orchestrationのCコード変更は行っていない。次の実装は、NetBSD autoconfiguration側のVC4 attach構造を確認してから開始する。
