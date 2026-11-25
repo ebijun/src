@@ -2821,3 +2821,309 @@ NetBSD側では、単純に配列順をコピーするのではなく、各subdr
 - Linux component frameworkのbind順をNetBSD側へ機械的に移すのではなく、NetBSD attach graphとして依存を明示する必要がある。
 
 本節の追記時点では、VC4 subdriverのCソース変更、NetBSD CFATTACH追加、component framework実装は行っていない。ソース未確認の4 driverについては、実装推測を避け、ソース確保後に本節を更新する。
+
+
+### 10.23 VEC/DPI/DSI/TXPのupstreamソース所在とNetBSD CFATTACH/attach graph確定
+
+10.22節では4ファイルをbranch内で取得できず、実装詳細を未確認としていた。本節では、directoryのREADMEに記載されたimport元Linux v5.6を基準に、欠落4ファイルの正確な所在を確認し、v5.6のcomponent bind順とNetBSD側のCFATTACH設計案を確定する。
+
+#### 10.23.1 branch内の所在確認とupstream source
+
+branch `vc4-drmkms` の `sys/external/bsd/drm2/dist/drm/vc4/` をGitHub Contents APIで確認した。directoryに存在するのはREADME、CRTC/DRV/DRV.H/HDMI/HVS/KMS/PLANE/REGS/V3Dであり、VEC/DPI/DSI/TXPの4ファイルは存在しない。
+
+同directoryの `README.md` は次を明記している。
+
+- Upstream Source: Linux Kernel `drivers/gpu/drm/vc4/`
+- Upstream Tag/Commit: `v5.6`
+- Imported Files listには `vc4_vec.c`、`vc4_dpi.c`、`vc4_dsi.c`、`vc4_txp.c` が含まれていない。
+
+従って、欠落4ファイルの基準ソースはLinux v5.6 tagである。以下のGitHub URLは同tagのファイルを直接指す。
+
+| subdriver | upstream v5.6 source | blob SHA | FDT compatible |
+|---|---|---|---|
+| VEC | [vc4_vec.c](https://github.com/torvalds/linux/blob/v5.6/drivers/gpu/drm/vc4/vc4_vec.c) | `7402bc768664ccd47d66e5168769784d52fd20b8` | `brcm,bcm2835-vec` |
+| DPI | [vc4_dpi.c](https://github.com/torvalds/linux/blob/v5.6/drivers/gpu/drm/vc4/vc4_dpi.c) | `c586325de2a5bd09589eb28cdb636b7aed68fbfd` | `brcm,bcm2835-dpi` |
+| DSI | [vc4_dsi.c](https://github.com/torvalds/linux/blob/v5.6/drivers/gpu/drm/vc4/vc4_dsi.c) | `fd8a2eb60505389e637c6bb88ce29570f66adc88` | `brcm,bcm2835-dsi1` |
+| TXP | [vc4_txp.c](https://github.com/torvalds/linux/blob/v5.6/drivers/gpu/drm/vc4/vc4_txp.c) | `bf720206727f08d3b72454133dd4e1f8d51ad909` | `brcm,bcm2835-txp` |
+
+上記blob SHAはGitHubが返した各v5.6ファイルblobの識別子である。NetBSD branchのblob SHAではない。今後importする場合は、Linux v5.6を基準にし、現在のLinux masterのコードを混在させないこと。
+
+#### 10.23.2 欠落4 subdriverの機能とbind処理
+
+**VEC — `vc4_vec.c`**
+
+- compatible: `brcm,bcm2835-vec`
+- probe: `component_add()`。remove: `component_del()`
+- bind: resource index 0をMMIO map、clockを取得、runtime PMをenableし、TV encoderとComposite connectorを生成する。
+- unbind: connector/encoderを破棄しruntime PMをdisable、`vc4->vec` をNULLにする。
+- encoder typeは `VC4_ENCODER_TYPE_VEC`。NTSC/PAL等のTV mode propertyを扱う。
+- CRTC pixelvalve2のencoder type tableにVECが存在するため、CRTCのpossible_crtcs計算より前にencoderが生成されていなければならない。
+
+**DPI — `vc4_dpi.c`**
+
+- compatible: `brcm,bcm2835-dpi`
+- probe/remove: component add/del
+- bind: resource index 0をMMIO mapし、DPI ID registerを検証、`core` と `pixel` clockを取得する。DPI encoderを生成し、FDTからpanel/bridgeを検索して接続する。
+- unbind: panel bridgeをremove、encoderをcleanup、core clockをdisableし、`vc4->dpi` をNULLにする。
+- encoder typeは `VC4_ENCODER_TYPE_DPI`。CRTC pixelvalve0のencoder type tableと一致する。
+- panel/bridgeは外部deviceであり、DPI本体のattachだけで接続先の準備完了を保証しない。NetBSD側ではpanel/bridge側のattach/deferとの関係を別途管理する。
+
+**DSI — `vc4_dsi.c`**
+
+- compatible: v5.6では `brcm,bcm2835-dsi1`。match dataからport番号1を設定する。
+- probe: `struct vc4_dsi` を確保し、MIPI-DSI hostを登録してから `component_add()` を行う。
+- remove: componentを削除してからMIPI-DSI hostをunregisterする。
+- bind: resource index 0、DSI ID、IRQ、escape/PHY/pixel clock、panel/bridgeを扱う。DSI1ではregister DMA用memoryとDMA channelも取得する。encoderとbridge chainを初期化し、runtime PMをenableする。
+- unbind: runtime PMをdisableし、bridge chainを戻してencoderをdestroy、`vc4->dsi1` をNULLにする。
+- encoder typeは `VC4_ENCODER_TYPE_DSI1`。CRTC pixelvalve1のencoder type tableに対応する。
+- **重要なattach依存:** panel/bridgeがMIPI-DSI hostを必要とし、DSI側のbindがpanel/bridgeを必要とする循環を避けるため、Linux v5.6はcomponent bindより先のplatform probeでhostを登録する。NetBSD移植でもhost登録をmaster bindまで遅らせてはならない。FDT attach時のhost登録と、DRM encoder生成時のbind処理を分離する。
+- v5.6 sourceはDSI1のみをmatchする。DSI0を実装済みと推定しない。
+
+**TXP — `vc4_txp.c`**
+
+- compatible: `brcm,bcm2835-txp`
+- probe/remove: component add/del
+- bind: IRQ取得、resource index 0のMMIO map、writeback connector生成、IRQ登録、`vc4->txp` 設定を行う。
+- unbind: writeback connectorをdestroyし、`vc4->txp` をNULLにする。
+- TXP interruptはCRTC vblank処理とwriteback completionを通知する。
+- CRTC側はHVS channel 2でvirtual encoderを扱う特別分岐を持つ。TXP/writeback connectorを含むencoder/connector構成をCRTCのpossible_crtcs計算前に完成させるため、TXP bindはCRTC bindより前に置く。
+
+#### 10.23.3 v5.6 component bind順の確定
+
+branchの `vc4_drv.c` とLinux v5.6 upstream `vc4_drv.c` は同じ `component_drivers[]` 順序を持つ。
+
+```c
+static struct platform_driver *const component_drivers[] = {
+        &vc4_hdmi_driver,
+        &vc4_vec_driver,
+        &vc4_dpi_driver,
+        &vc4_dsi_driver,
+        &vc4_txp_driver,
+        &vc4_hvs_driver,
+        &vc4_crtc_driver,
+        &vc4_v3d_driver,
+};
+```
+
+Linux v5.6の `vc4_match_add_drivers()` はこの配列順にdriverを走査し、各driverに一致するdeviceをcomponent match listへ追加する。Linux v5.6 `drivers/base/component.c` の `component_bind_all()` はmatch listの順にbindし、失敗した場合は既にbindしたcomponentを逆順にunbindする。従って、v5.6における実際のbind順は次のとおりである。
+
+1. HDMI
+2. VEC
+3. DPI
+4. DSI
+5. TXP
+6. HVS
+7. CRTC / PixelValve（該当するPixelValve nodeすべて）
+8. V3D
+
+この順序はNetBSD移植時に再現すべきv5.6の基準順である。ただし、これをautoconfigurationのprobe/attach実行順として実装してはならない。Linux側でもplatform driverのprobe時点ではcomponentを登録するだけで、master bind時にmatch list順でhardware/DRM objectを生成する二段階構造だからである。
+
+#### 10.23.4 依存関係図
+
+以下はv5.6の実装から導ける「先にbindされている必要がある」関係である。矢印A → Bは、Aのbind完了後にBをbindすることを表す。
+
+```mermaid
+flowchart TD
+    HDMI[HDMI encoder / connector]
+    VEC[VEC encoder / connector]
+    DPI[DPI encoder]
+    DSI[DSI1 encoder / bridge]
+    TXP[TXP writeback connector]
+    HVS[HVS display list / LBM / IRQ]
+    CRTC[CRTC / PixelValve]
+    V3D[V3D engine / IRQ / PM]
+
+    HDMI --> CRTC
+    VEC --> CRTC
+    DPI --> CRTC
+    DSI --> CRTC
+    TXP --> CRTC
+    HVS --> CRTC
+    V3D -. optional / independent .- CRTC
+```
+
+依存関係の根拠:
+
+- HDMI/VEC/DPI/DSIはencoderを生成する。CRTC bindの `vc4_set_crtc_possible_masks()` はDRM encoder listを走査し、encoder typeとPixelValveの対応を調べる。
+- TXPはwriteback connectorを生成する。CRTC側にはHVS channel 2とvirtual encoderに関する特別処理があるため、TXPを含むwriteback側のDRM object生成をCRTCより前に完了させる。
+- HVS bindは `vc4->hvs`、display list/LBM manager、filter kernelを設定する。CRTC bindの `vc4_crtc_get_cob_allocation()` はHVSの `SCALER_DISPBASEX` registerを読むため、HVSはCRTCより前でなければならない。
+- V3Dは独立した3D engineであり、CRTCのencoder mask計算やHVS COB取得には参加しない。master bind前のFDT node有無判定でrender capabilityを決めるため、component bind順では最後に置く。V3D nodeがない場合はoptionalとして扱う。
+
+この図はv5.6で確認した依存だけを示す。後のLinux kernelで追加された別の依存やbind順変更をv5.6 branchに持ち込まない。
+
+#### 10.23.5 NetBSD CFATTACH構造案
+
+NetBSDではLinux platform driver登録を再現するのではなく、FDT nodeごとにCFATTACHでdeviceを発見し、VC4 masterが各subdriver softcを集約する構造とする。
+
+**A. Master CFATTACH**
+
+- driver名案: `vc4drm`
+- match compatible: `brcm,bcm2835-vc4`、`brcm,cygnus-vc4`（branch `vc4_drv.c` の `vc4_of_match[]` に合わせる）
+- softc: DRM master、VC4全体の状態、component registry、bind済みcomponent stackを所有する。
+- attach: coordinatorを初期化し、subdriverのattach登録完了後にdeferred master initializationを開始する。
+- detach: DRMをunregister/shutdownした後、bind済みcomponentを逆順でunbindし、coordinatorを解放する。
+
+**B. subdriver CFATTACH**
+
+以下のFDT matchを個別のCFATTACHに対応させる。
+
+| CFATTACH driver案 | compatible | softcが保持する主な情報 |
+|---|---|---|
+| `vc4hdmi` | `brcm,bcm2835-hdmi` | device_t、OF node、MMIO/clock/DDC/HPD情報 |
+| `vc4vec` | `brcm,bcm2835-vec` | device_t、OF node、MMIO/clock |
+| `vc4dpi` | `brcm,bcm2835-dpi` | device_t、OF node、MMIO/core/pixel clock、panel/bridge |
+| `vc4dsi` | `brcm,bcm2835-dsi1` | device_t、OF node、MIPI-DSI host、MMIO/IRQ/clock/DMA |
+| `vc4txp` | `brcm,bcm2835-txp` | device_t、OF node、MMIO/IRQ |
+| `vc4hvs` | `brcm,bcm2835-hvs` | device_t、OF node、MMIO/IRQ、HVS memory manager |
+| `vc4crtc` | `brcm,bcm2835-pixelvalve0/1/2` | device_t、OF node、match data、MMIO/IRQ |
+| `vc4v3d` | `brcm,bcm2835-v3d`（v5.6 match tableの他compatibleも保持） | device_t、OF node、MMIO/IRQ/clock/PM |
+
+CFATTACHのattachはcomponentの発見・登録を行う段階とし、master DRM deviceに依存するencoder/connector/CRTC object生成はdeferred bind段階に分離する。subdriverのdetachはregistryから外し、masterが既にbind済みなら安全なunbindを先に実施する。detach順はNetBSD autoconfigurationの実際の親子関係・device busy制約に従う。
+
+**C. device_tとOF nodeの関連付け**
+
+Linuxの `vc4_match_add_drivers()` はmasterの子deviceだけを列挙するのではなく、登録済みplatform driverごとにdeviceを検索してmatch listを作る。NetBSDで単純にmasterの `device_t` 子だけを走査する設計にしてはならない。
+
+各subdriver CFATTACHは `device_t` とNetBSD OF node handleをregistryに登録する。masterは自身のOF node/SoC範囲と照合して対象component集合を決定する。複数SoCや複数masterを想定し、単一のglobal softc pointerに依存しない。componentの同一性は `device_t` とOF node handleで管理し、`struct device *` へのcastや `device_private()` の無条件castでLinux platform deviceを再現しない。
+
+#### 10.23.6 NetBSD attachとbindの実行順
+
+**Phase 1: FDT/CFATTACH discovery（実行順は依存させない）**
+
+- 各compatibleに対応するCFATTACHがnodeをmatchする。
+- softcに `device_t`、OF node、resource情報を保存する。
+- component registryに登録する。
+- DSIは例外として、panel/bridgeのprobeがMIPI-DSI hostを待つ循環を避けるため、DRM bind前にMIPI-DSI hostを登録する。
+- masterはcomponentがまだ不足している場合、直ちにDRM objectを生成せずdeferする。
+
+**Phase 2: master bind（順序を固定）**
+
+```text
+vc4_drm_master_bind()
+  1. DRM master / vc4_dev を初期化
+  2. HDMI bind
+  3. VEC bind
+  4. DPI bind
+  5. DSI1 bind
+  6. TXP bind
+  7. HVS bind
+  8. 全PixelValve CRTC bind
+  9. V3D bind（存在する場合）
+ 10. vc4_kms_load()
+ 11. drm_dev_register()
+```
+
+各componentが存在しない場合の扱いは一律必須にしない。V3Dは明確にoptionalであり、欠落時はrender node capabilityを無効にする。HDMI/VEC/DPI/DSI/TXPもboard/device treeに応じて不在となり得る。一方、CRTCやHVSの不在を許容するか、少なくとも1つのdisplay pipelineを必須にするかは、対象Raspberry PiのFDTと利用目的に応じてmaster policyとして定義する。Linux v5.6のmatch listは存在するplatform deviceを列挙する方式であり、すべてのcompatibleが必ず存在することを要求するものではない。
+
+**Phase 3: failure rollback / detach**
+
+- bind失敗時は、成功済みcomponentのみを逆順でunbindする。
+- v5.6のcomponent frameworkもbind失敗時にmatch listを逆順でunbindする。
+- NetBSDでは成功したbindをstack/listに記録し、失敗時にそのstackをpopしてrollbackする。
+- master teardownではDRM unregister/shutdownとKMS object cleanupの順序を守り、その後componentを逆順にunbindする。
+- DSI hostはcomponent unbindとは別のprobe/attach資源なので、MIPI-DSI device/panel側のdetach関係を確認した後、DSI subdriver detachでunregisterする。
+- resource/IRQ/clockの解放は各subdriver softcの所有範囲で行い、masterとsubdriverの両方から二重解放しない。
+
+#### 10.23.7 CFATTACH設計の擬似コード
+
+以下は設計を示す擬似コードであり、そのままコンパイル可能な実装ではない。NetBSDの実際のFDT match/attach関数名、resource API、deferred attach APIに合わせて具体化する。
+
+```c
+struct vc4_component {
+        device_t                vc_dev;
+        int                     vc_phandle;
+        enum vc4_component_type vc_type;
+        bool                    vc_bound;
+        TAILQ_ENTRY(vc4_component) vc_entry;
+};
+
+struct vc4_master_softc {
+        device_t                sc_dev;
+        struct drm_device       *sc_drm;
+        TAILQ_HEAD(, vc4_component) sc_components;
+        struct vc4_component    *sc_bind_order[VC4_COMPONENT_MAX];
+        unsigned int            sc_nbound;
+};
+
+/* Each subdriver CFATTACH matches its own FDT compatible.
+ * Attach registers the device; DRM objects are created at master bind.
+ */
+static void
+vc4_subdriver_attach(device_t parent, device_t self, void *aux)
+{
+        struct vc4_component *vc = device_private(self);
+
+        vc->vc_dev = self;
+        vc->vc_phandle = /* OF node associated with self */;
+        vc->vc_type = /* type selected by this CFATTACH */;
+        vc4_component_register(parent, vc);
+}
+
+/* Master binds only after its component set has been discovered. */
+static int
+vc4_master_bind(struct vc4_master_softc *sc)
+{
+        static const enum vc4_component_type order[] = {
+                VC4_COMPONENT_HDMI,
+                VC4_COMPONENT_VEC,
+                VC4_COMPONENT_DPI,
+                VC4_COMPONENT_DSI,
+                VC4_COMPONENT_TXP,
+                VC4_COMPONENT_HVS,
+                VC4_COMPONENT_CRTC,
+                VC4_COMPONENT_V3D,
+        };
+        unsigned int i;
+        int error;
+
+        for (i = 0; i < ARRAY_SIZE(order); i++) {
+                struct vc4_component *vc;
+
+                vc = vc4_component_lookup(sc, order[i]);
+                if (vc == NULL)
+                        continue;       /* optional policy checked separately */
+
+                error = vc4_component_bind(sc, vc);
+                if (error)
+                        goto rollback;
+                sc->sc_bind_order[sc->sc_nbound++] = vc;
+                vc->vc_bound = true;
+        }
+
+        return 0;
+
+rollback:
+        while (sc->sc_nbound != 0) {
+                struct vc4_component *vc;
+
+                vc = sc->sc_bind_order[--sc->sc_nbound];
+                vc4_component_unbind(sc, vc);
+                vc->vc_bound = false;
+        }
+        return error;
+}
+```
+
+上記ではcomponentの検索/登録API名を設計上の仮名としている。実装時にはNetBSD device_tの親子関係、OF nodeの所属、detach可能性、複数instanceの扱いを確定してから実際の関数にする。
+
+#### 10.23.8 実装上の結論と残作業
+
+確定した事項:
+
+1. VEC/DPI/DSI/TXPのupstream sourceはLinux v5.6の `drivers/gpu/drm/vc4/` に存在し、NetBSD branchへの未取り込みが原因である。
+2. 4ファイルのFDT compatible、bind処理、resource/clock/IRQ/bridge依存を確認した。
+3. NetBSDのCFATTACHはmasterと8 subdriverに分割し、FDT discoveryとDRM bindを二段階にする。
+4. bind順はv5.6の実配列順 HDMI→VEC→DPI→DSI→TXP→HVS→CRTC→V3D とする。
+5. CRTCは全encoder/writeback objectとHVSに依存する。V3Dは独立optional componentである。
+6. DSI hostだけはpanel/bridgeとの循環依存を避けるため、DRM bind前のDSI attach/probe段階で登録する。
+7. failure rollbackとmaster detachは成功済みcomponentの逆順unbindとする。
+
+まだ実装前に確定が必要な事項:
+
+- NetBSDの実FDT treeでmaster nodeと各subdriver nodeがどのbus/device_t配下にattachするか。
+- component registryをmaster単位に関連付けるOF ancestor/SoC範囲の規則。
+- HVS/CRTC/encoderが欠落した場合のboard別必須条件。
+- panel/bridge、MIPI-DSI host、I2C DDC、clock、GPIO、IRQのNetBSD native APIとdetach順。
+- 既存のNetBSD BCM2835 FDT driver群とのresource競合・attach ownership。
+
+本節は調査と設計を記録するものであり、4つのupstream sourceをNetBSD branchへ追加したものではない。またCFATTACHコードはまだ作成・ビルドしていない。
