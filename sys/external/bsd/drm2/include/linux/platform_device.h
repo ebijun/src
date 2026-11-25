@@ -34,6 +34,7 @@
 
 #include <sys/device.h>
 #include <sys/bus.h>
+#include <dev/ofw/openfirm.h>
 
 #include <sys/types.h>
 #include <linux/device.h>
@@ -53,6 +54,27 @@ struct platform_device {
 		bus_size_t	len;
 	}		resource[NUM_PLATFORM_RESOURCE];
 };
+
+/*
+ * Return the Open Firmware node handle for a platform device,
+ * or -1 if the device has no valid OF device handle.
+ */
+static inline int
+platform_device_of_node(const struct platform_device *pdev)
+{
+	devhandle_t handle;
+
+	if (pdev == NULL || pdev->pd_dev == NULL)
+		return -1;
+
+	handle = device_handle(pdev->pd_dev);
+	if (!devhandle_is_valid(handle))
+		return -1;
+	if (devhandle_type(handle) != DEVHANDLE_TYPE_OF)
+		return -1;
+
+	return devhandle_to_of(handle);
+}
 
 static inline device_t
 platform_device_dev(const struct platform_device *platformdev)
