@@ -3127,3 +3127,225 @@ rollback:
 - 既存のNetBSD BCM2835 FDT driver群とのresource競合・attach ownership。
 
 本節は調査と設計を記録するものであり、4つのupstream sourceをNetBSD branchへ追加したものではない。またCFATTACHコードはまだ作成・ビルドしていない。
+
+
+### 10.24 NetBSD既存FDT driverとのresource共有・競合、およびattach先調査
+
+本節では、対象branch `vc4-drmkms` のNetBSD既存FDT driver、kernel config定義、FDT bus attach処理を確認し、VC4各subdriverを追加する際のresource ownershipと実際のdevice_t親子関係を整理する。
+
+調査対象:
+
+- `sys/arch/arm/broadcom/files.bcm2835`
+- `sys/arch/arm/broadcom/bcm2835_bsc_fdt.c`
+- `sys/arch/arm/broadcom/bcm2835_cprman.c`
+- `sys/arch/arm/broadcom/bcm2835_gpio.c`
+- `sys/arch/arm/broadcom/bcm2835_genfb.c`
+- `sys/dev/fdt/fdtbus.c`
+- `sys/dev/fdt/files.fdt`
+- `sys/dev/fdt/hdmi_connector.c`
+- `sys/dev/fdt/connector_fdt.c`
+- `sys/dev/fdt/fdt_panel.c`
+- `sys/dev/fdt/simplefb.c`
+- `sys/external/bsd/drm2/vc4/vc4_fdt.c`
+
+#### 10.24.1 現在のVC4 FDT attach実装
+
+`sys/external/bsd/drm2/vc4/vc4_fdt.c` は次のmaster compatibleをmatchする。
+
+- `brcm,bcm2835-vc4`
+- `brcm,bcm2837-vc4`
+- `brcm,bcm2711-vc4`
+
+attachはsoftcに `device_t`、OF phandle、bus_space tagを保存し、現在は `TODO: DRM2 device initialization and FDT binding logic` を出力するだけである。
+
+`sys/arch/arm/broadcom/files.bcm2835` にあるVC4関連config定義も現在はmasterのみである。
+
+```text
+device  vc4drm: drmkms
+attach  vc4drm at fdt with vc4_fdt
+file    external/bsd/drm2/vc4/vc4_fdt.c vc4drm
+```
+
+現時点で次のVC4 hardware compatibleに対応するNetBSD CFATTACH/config entryは確認できなかった。
+
+- `brcm,bcm2835-hdmi`
+- `brcm,bcm2835-vec`
+- `brcm,bcm2835-dpi`
+- `brcm,bcm2835-dsi1`
+- `brcm,bcm2835-txp`
+- `brcm,bcm2835-hvs`
+- `brcm,bcm2835-pixelvalve0/1/2`
+- `brcm,bcm2835-v3d`
+
+従って、master CFATTACHがattachすることと、各subdriverのFDT nodeがNetBSD deviceとしてattachされることは別問題である。subdriverごとのCFATTACHとkernel config定義を追加する必要がある。
+
+#### 10.24.2 FDT busの実際のdevice_t親子関係
+
+`sys/dev/fdt/fdtbus.c` の動作を確認した。
+
+1. FDT rootのsimplebusが子nodeを列挙する。
+2. `simple-bus` / `simple-pm-bus` nodeはそれぞれsimplebus CFATTACHとしてattachし、そのsimplebus device_tをbusとしてさらに子nodeを登録する。
+3. 各nodeは `fdt_add_child(bus, child, ...)` により、直近のsimplebus device_tを `node->n_bus` に持つ。
+4. `fdt_scan()` はその `node->n_bus` に対して `config_attach()` または `config_found()` を行う。
+5. attach時のdevice handleは `devhandle_from_of(nodeh, node->n_phandle)` としてOF nodeを保持する。
+
+このため、VC4 master nodeとhardware block nodeのdevice_t親が同一とは限らない。たとえば、root直下の `gpu` nodeにattachする `vc4drm` と、`/soc` simple-bus配下のHDMI/HVS/PixelValve/V3D nodeにattachするsubdriverは、異なるsimplebus device_tを親に持つ可能性がある。
+
+**設計上の結論:** subdriverをmasterの子device_tとして検索する方式は採用しない。NetBSD FDT attachは各nodeのbus階層に従い、masterとsubdriverの関係は別のcomponent registryで表現する。registryのinstance識別はdevice_tだけでなくOF phandle/devhandleを用いる。SoC/masterとの対応はFDT ancestorまたはSoC node単位で決定し、単一global master pointerには依存しない。
+
+#### 10.24.3 既存Broadcom FDT providerのresource ownership
+
+| 既存driver | compatible / config | 現在のresource ownership | VC4側の利用方法・注意 |
+|---|---|---|---|
+| `bcmgpio` | `brcm,bcm2835-gpio`等 / `bcmgpio at fdt` | GPIO controllerのreg、GPIO interrupt、gpiobus | HDMI HPD等はGPIO provider経由で取得する。VC4側でGPIO controllerのregを再mapしない |
+| `bcmcprman_fdt` | `brcm,bcm2835-cprman`、`brcm,bcm2711-cprman` | FDT clock controller登録 | VC4のpixel/core/PHY/escape等clockはproviderから取得する。CPRMAN registerをVC4側で直接所有しない |
+| `bsciic_fdt` | `brcm,bcm2835-i2c` / `bsciic at fdt` | BSC I2C reg、clock、IRQ、iicbus | HDMI DDCは既存I2C adapterを利用する。BSC regをHDMI driverでmapしない |
+| `bcmmbox_fdt` | `brcm,bcm2835-mbox` | mailbox reg/IRQ | genfb等のfirmware経由機能に関係する。VC4 display blockのregとは別node |
+| `bcmgenfb` | `brcm,bcm2835-fb` | firmwareが設定したframebuffer memoryをmapしgenfb consoleを提供 | HDMI/HVS/CRTC registerの所有者ではない。DRM takeover時はconsoleとscanout memoryのhandoffを管理 |
+| `simplefb` | `simple-framebuffer` / `sys/dev/fdt/files.fdt` | FDT simple-framebufferのmemory rangeをmapしgenfbを提供 | VC4 registerとは別resource。ただしDRM scanout開始時のframebuffer memory/console handoffに注意 |
+
+##### CPRMAN clock providerの重要な未対応点
+
+現行 `bcm2835_cprman.c` はclock controllerを登録しているが、`cprman_add_clock()` で登録するclock名は現状次の4つだけである。
+
+- `uart`
+- `vpu`
+- `emmc`
+- `emmc2`
+
+また `cprman_get_rate()` がrate取得を処理するIDもUART/VPU/EMMC/EMMC2のみで、それ以外は `panic("unsupported clock id")` となる。
+
+VC4 subdriverが必要とするclockにはHDMIのpixel/HSM、VEC、DPIのcore/pixel、DSIのPHY/escape/pixel、V3D等がある。従って現状のCPRMAN providerはVC4用clock APIとして不十分であり、単に `fdtbus_clock_get_*` を呼ぶだけでは動作を保証できない。必要なclock ID、name、rate/enable処理をNetBSD provider側で追加・検証する必要がある。これはMMIO resourceの二重mapとは別のprovider機能不足である。
+
+#### 10.24.4 VC4各blockのresourceと既存driverの競合評価
+
+下表のresourceはLinux v5.6 VC4 driverおよび対応するFDT bindingに基づく。既存NetBSD driverのcompatible/configと照合した結果、VC4 hardware blockそのものに一致する既存NetBSD CFATTACHは確認できなかった。
+
+| VC4 block | FDT resource | 既存NetBSD driverとの直接reg競合 | 共有すべき既存provider |
+|---|---|---|---|
+| HDMI | 2つのreg range、複数IRQ、pixel/HDMI clock、DDC、HPD GPIO | 該当compatibleのhardware driverなし | CPRMAN、BSC I2C、GPIO |
+| VEC | reg、IRQ、VEC clock | 該当driverなし | CPRMAN |
+| DPI | reg、core/pixel clock、panel endpoint | 該当driverなし | CPRMAN、FDT port/panel |
+| DSI1 | reg、IRQ、PHY/escape/pixel clock、DSI clock outputs、panel/bridge | 該当driverなし | CPRMAN、FDT port/panel、MIPI-DSI host registry |
+| TXP | reg、IRQ | 該当driverなし | 割り込みcontroller |
+| HVS | reg、IRQ | 該当driverなし | 割り込みcontroller |
+| PixelValve0/1/2 | 各nodeのreg、IRQ | 該当driverなし | 割り込みcontroller |
+| V3D | reg、IRQ、optional clock | 該当driverなし | CPRMAN、割り込みcontroller |
+
+現時点での結論は「既存driverとの直接的なVC4 block reg競合は見つからない」である。ただし、これは対象branchのCFATTACH/configと既存driverのresource取得方法の調査結果であり、実機で使用するDTB全体のreg rangeを数値比較したものではない。実際のDTBに対するrange overlap検証は、対象Raspberry Pi modelとDTBを固定した後に行う。
+
+VC4 subdriver実装では、各nodeの `fdtbus_get_reg(phandle, index, ...)` と `bus_space_map()` によって当該blockのregのみを所有する。GPIO/clock/I2Cはprovider APIを使い、providerのMMIOを再mapしない。IRQも各nodeのinterrupt specifierから確立し、providerや他blockのIRQを横取りしない。
+
+#### 10.24.5 HDMI DDC/HPDの既存driverとの接続
+
+既存 `bcm2835_bsc_fdt.c` はBSC nodeをmatchし、regをmap、clockをenable、IRQを確立してiicbusをattachする。HDMI DDCはこのI2C adapterを利用すべきであり、VC4 HDMI driverがBSC hardwareを直接mapする設計にはしない。
+
+ただしproperty/APIの差がある。
+
+- Linux VC4 HDMI sourceはHDMI hardware nodeの `ddc` phandleを解決する。
+- 既存NetBSD `sys/dev/fdt/hdmi_connector.c` はconnector nodeから `ddc-i2c-bus` を `fdtbus_i2c_acquire()` で取得する。
+- Linux VC4 HDMI sourceはhardware node上の `hpd-gpios` を扱う。
+- NetBSD `hdmi_connector.c` は `hdmi-connector` node上の `hpd-gpios` を取得する。
+
+従ってLinux propertyをそのままNetBSD generic connectorのpropertyとして扱えない。VC4 HDMI componentがDDC/HPDを所有するのか、generic connectorが所有するのかを一つに決め、FDT propertyの配置とbridge APIを統一する。
+
+#### 10.24.6 HDMI connectorの競合・二重所有リスク
+
+`sys/dev/fdt/files.fdt` には、同じ `hdmi-connector` compatibleを対象とする2つのattach候補がある。
+
+- `connector at fdt with fdt_connector` — `connector_fdt.c`、`EP_CONNECTOR` endpointを提供する。
+- `dispcon at fdt with dispcon_hdmi` — `hdmi_connector.c`、DRM connectorを生成し、encoder endpointへ接続する。
+
+FDT busは1つのFDT nodeに対して選択されたconfig driverをattachするため、両方を同一nodeに二重attachする設計ではない。しかし、同じcompatibleに複数のCFATTACH候補が存在し、どちらが選ばれるかはkernel configとmatch/passの選択に依存する。VC4 HDMIを統合する際は対象kernelの実際の選択結果を確認する。
+
+さらに、現在のLinux由来 `vc4_hdmi.c` のbindはHDMI encoder/connectorを内部で初期化する。一方、NetBSD `dispcon_hdmi` もDRM connectorを生成する設計である。両者をそのまま同時に有効にすると、同じ物理HDMI出力に対してconnectorを二重生成する可能性がある。
+
+採用方針は次のどちらかに統一する。
+
+A. VC4 HDMI componentがencoder/connector/DDC/HPDを所有し、generic `dispcon_hdmi` はその出力nodeに対して使わない。
+
+B. VC4 HDMI componentはencoder endpointをFDT portへ公開し、NetBSD `dispcon_hdmi` がconnector/DDC/HPDを所有する。この場合、VC4 HDMI内部connector生成処理を無効化/置換する。
+
+現行のLinux由来HDMI bindを保持するならAが最小変更だが、既存FDT graphとの整合は実際のDTSとendpoint実装で確認する。Bを採用する場合はconnector所有権を明確に分離する。
+
+#### 10.24.7 DPI/DSI panel・bridgeとの接続
+
+既存 `sys/dev/fdt/fdt_panel.c` は `simple-panel` 等をmatchし、`drm_panel` を生成してFDT port endpointとして登録する。既存 `panel_fdt.c` はLVDS panel用であり、用途が異なる。
+
+DPI/DSI componentを取り込む際は、panel/bridge nodeをVC4 subdriverが直接attachしたりregをmapしたりしない。panel/bridge側CFATTACHの `drm_panel` / endpointを参照する設計とする。
+
+DSIではさらに、MIPI-DSI host登録とDRM component bindを分離する。DSI panelがhost登録を待つ一方でhost側がpanelを待つ循環を避けるため、DSI hostはFDT attach段階で登録し、encoder/bridge chainのDRM bindはmaster bind段階で行う。既存 `fdt_panel.c` のFDT DRM panel endpointだけでMIPI-DSI host bus登録まで代替できるとは見なさない。
+
+#### 10.24.8 genfb/simplefbとDRM KMSのownership
+
+`bcm2835_genfb` は `brcm,bcm2835-fb` nodeをmatchし、firmwareが設定したframebuffer addressをmapする。`simplefb` は `simple-framebuffer` nodeのregをmapする。いずれもHDMI/HVS/CRTCのregister rangeを直接mapするdriverではないため、VC4 blockのMMIOと直接競合するものではない。
+
+一方、これらはboot console/framebufferを表示する。DRM KMSがdisplay pipelineを再programすると、firmware framebufferとHVS/CRTC scanoutの所有関係が変わる。VC4 DRM attach時に既存genfbを直ちにdetach/破棄するのではなく、console保持、framebuffer memoryの参照寿命、KMS初期mode設定、console handoffの順序を別途設計する。
+
+#### 10.24.9 NetBSDでのattach先・config定義方針
+
+各VC4 nodeはFDT busにattachする独立deviceとし、VC4 masterのdevice_t子であることを前提にしない。config定義は現行 `files.bcm2835` のVC4 master entryを拡張する形を第一候補とする。
+
+設計上のdriver分割:
+
+| NetBSD device / CFATTACH案 | attach先 | FDT compatible |
+|---|---|---|
+| `vc4drm / vc4_fdt` | `fdt` | `brcm,bcm2835-vc4`、`brcm,bcm2837-vc4`、`brcm,bcm2711-vc4` |
+| `vc4hdmi / vc4_hdmi_fdt` | `fdt` | `brcm,bcm2835-hdmi` |
+| `vc4vec / vc4_vec_fdt` | `fdt` | `brcm,bcm2835-vec` |
+| `vc4dpi / vc4_dpi_fdt` | `fdt` | `brcm,bcm2835-dpi` |
+| `vc4dsi / vc4_dsi_fdt` | `fdt` | `brcm,bcm2835-dsi1` |
+| `vc4txp / vc4_txp_fdt` | `fdt` | `brcm,bcm2835-txp` |
+| `vc4hvs / vc4_hvs_fdt` | `fdt` | `brcm,bcm2835-hvs` |
+| `vc4crtc / vc4_crtc_fdt` | `fdt` | `brcm,bcm2835-pixelvalve0/1/2` |
+| `vc4v3d / vc4_v3d_fdt` | `fdt` | v5.6 sourceのV3D compatible set |
+
+この表はconfig/CFATTACH設計案であり、現在のbranchにこれらのdevice/CFATTACHが実装済みという意味ではない。PixelValveはcompatibleごとに複数nodeが存在するため、1つのCFATTACHがmatch dataでchannel/encoder typeを区別する。DSIはこのv5.6 sourceではDSI1のみを対象とする。
+
+各subdriver attachの役割:
+
+1. `fdt_attach_args` からphandle、bus_space tag、DMA tagを取得する。
+2. `device_handle(self)` / `platform_device_of_node()` 相当のNetBSD OF handleを保持する。
+3. node固有resourceの存在・範囲を検査する。
+4. component registryに `device_t` とOF nodeを登録する。
+5. DRM encoder/connector/CRTC等の生成はmaster bind段階に遅延する。
+6. detach時はregistry登録解除と、所有しているresource/provider参照の解放を行う。
+
+FDT busのscan orderやattach passをcomponent bind順の代替に使わない。probe/attach完了順はnode階層やFDT scan orderに左右されるため、master bind時に10.23節の固定bind順を明示的に適用する。
+
+#### 10.24.10 resource ownership matrixと実装前チェック
+
+取り込み前に以下を確認する。
+
+| resource | owner | VC4側の原則 |
+|---|---|---|
+| HDMI/VEC/DPI/DSI/TXP/HVS/PixelValve/V3D各reg | 対応するVC4 subdriver | node単位で一度だけmap |
+| GPIO controller reg/IRQ | `bcmgpio` | GPIO provider APIのみ利用 |
+| CPRMAN clock provider | `bcmcprman_fdt` | clock consumer APIを利用。VC4 clock定義不足を先に補う |
+| BSC I2C reg/IRQ | `bsciic_fdt` | DDC adapterとして利用 |
+| HDMI connector endpoint | `dispcon_hdmi` またはVC4 HDMI component | connector/HPD/DDC ownershipを一方に統一 |
+| DPI/DSI panel/bridge | panel/bridge CFATTACH | DRM panel/bridge endpoint経由 |
+| boot framebuffer memory | `bcmgenfb` または `simplefb` | KMS takeover時のconsole handoffを設計 |
+| component registry | VC4 master/coordinator | device_t parentを仮定せずOF nodeで関連付け |
+
+実装開始前の必須チェック:
+
+1. 対象Raspberry Pi modelと実際に起動するDTBを固定し、VC4 blockの全 `reg` rangeとIRQ specifierを抽出する。
+2. 同じDTBの全nodeについてreg range overlapを機械的に検査し、同一rangeを複数driverがmapしないことを確認する。
+3. CPRMANにVC4必須clockのname/ID/rate/enable実装があるか確認し、不足clockをprovider側に追加する。
+4. HDMI connectorのownerをA/Bのどちらかに決め、`hdmi-connector` nodeのCFATTACH選択とFDT endpointを検証する。
+5. DPI/DSI panel/bridgeのFDT graphとDSI host登録順を検証する。
+6. `bcmgenfb` / `simplefb` のconsole状態を維持したままVC4 KMSへhandoffできることを確認する。
+7. `files.bcm2835` にsubdriver CFATTACH/config定義を追加し、FDT bus scanで各nodeが一度だけ正しいdriverにattachされることを確認する。
+8. master/subdriverのdetach・rollbackでMMIO、IRQ、clock、I2C、GPIO、panel/bridgeのresourceを二重解放しないことを確認する。
+
+#### 10.24.11 調査結果と取り込み判断
+
+- 既存NetBSD treeにはGPIO、CPRMAN、BSC I2C、mailbox、genfb、simplefb、HDMI connector、panel/bridgeのFDT driverが存在する。
+- VC4 hardware block compatibleを直接matchするNetBSD subdriver CFATTACH/configはまだ存在しない。master `vc4_fdt.c` も現在はTODO段階である。
+- FDT busは各nodeをその直近simplebus device_tの下にattachする。VC4 masterと各subdriverのdevice_t親が異なる場合があるため、device_t親子関係だけでcomponentを集約しない。
+- VC4 blockのregを既存GPIO/BSC/CPRMAN driverが同時に所有する直接競合は確認できなかった。ただし対象DTBのreg range overlapを数値検証したわけではないため、実機DTB固定後の検査を残す。
+- GPIO/clock/I2Cは既存providerを利用する。特に現行CPRMAN clock providerはVC4用clock定義が不足している。
+- HDMI connectorは `connector_fdt` と `dispcon_hdmi` の同compatible attach候補がある。VC4 HDMI componentの内部connector生成とのownershipを統一する必要がある。
+- genfb/simplefbはVC4 MMIOとは別resourceだが、KMS takeover時のconsole/framebuffer handoffが必要である。
+- 以上から、VEC/DPI/DSI/TXPのソースを取り込む前に、CFATTACH/configとresource ownershipの方針を確定した。実際のC source import、CFATTACH追加、DTB range検査、buildはまだ行っていない。
