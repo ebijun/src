@@ -4445,7 +4445,11 @@ void r600_mmio_hdp_flush(struct radeon_device *rdev)
 		void __iomem *ptr = rdev->vram_scratch.ptr;
 
 		WREG32(HDP_DEBUG1, 0);
+#ifdef __NetBSD__
+		(void)fake_readl(ptr);
+#else
 		(void)readl(ptr);
+#endif
 	} else
 		WREG32(R_005480_HDP_MEM_COHERENCY_FLUSH_CNTL, 0x1);
 }
