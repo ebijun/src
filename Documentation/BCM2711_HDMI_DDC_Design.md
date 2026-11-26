@@ -4974,3 +4974,26 @@ job分離はGENERIC64のビルド実行をearmv7hfから独立させる変更で
 GENERIC64のコンパイル成功を事前に保証するものではない。push後のActionsで
 aarch64 jobのtools作成、kernelビルド、artifact uploadがすべて成功したことを
 確認して初めて、単独ビルド成功と判定する。
+
+
+## 10.34 GENERIC64 CI #106: Radeon R600 readl再定義の修正
+
+### #106の結果
+
+独立job化後のActions run #106では、aarch64 GENERIC64のtools作成は完了し、
+カーネルのコンパイル中に `radeon_r600.o` で失敗した。
+エラーは `sys/external/bsd/drm2/dist/drm/radeon/radeon_r600.c` の
+NetBSD固有コードが `readl` を `fake_readl` に再定義していたことによる。
+NetBSD Linux-KPIの `include/asm/io.h` が既に `readl(addr)` を定義しているため、
+`-Werror` の `readl redefined` で停止した。
+
+### 修正
+
+`readl` のマクロ再定義を削除し、NetBSDビルドでは `fake_readl(ptr)`、
+それ以外ではLinux APIの `readl(ptr)` を直接呼ぶ条件分岐にした。
+同ファイル内のR600 PCIe GART flushとMMIO HDP flushの両方を対象とする。
+`__iomem` のNetBSD側定義は維持する。
+
+修正コミット: `561cab87f2f37c25c2663648dbd392f44d73b16b`。
+このコミットを含むActions run #108の完了を待ち、次のコンパイルエラーを確認する。
+この段階ではGENERIC64全体の成功を意味しない。
