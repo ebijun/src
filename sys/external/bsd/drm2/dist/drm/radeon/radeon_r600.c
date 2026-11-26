@@ -1083,7 +1083,6 @@ void r600_hpd_fini(struct radeon_device *rdev)
  */
 
 #  define	__iomem		volatile
-#  define	readl		fake_readl
 
 static inline uint32_t
 fake_readl(const void __iomem *ptr)
@@ -1116,7 +1115,11 @@ void r600_pcie_gart_tlb_flush(struct radeon_device *rdev)
 		 * method for them.
 		 */
 		WREG32(HDP_DEBUG1, 0);
+#ifdef __NetBSD__
+		(void)fake_readl(ptr);
+#else
 		(void)readl(ptr);
+#endif
 	} else
 		WREG32(R_005480_HDP_MEM_COHERENCY_FLUSH_CNTL, 0x1);
 
@@ -1140,7 +1143,6 @@ void r600_pcie_gart_tlb_flush(struct radeon_device *rdev)
 
 #ifdef __NetBSD__
 #  undef	__iomem
-#  undef	readl
 #endif
 
 int r600_pcie_gart_init(struct radeon_device *rdev)
