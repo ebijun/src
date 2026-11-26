@@ -130,7 +130,6 @@ uint64_t rv370_pcie_gart_get_page_entry(uint64_t addr, uint32_t flags)
  */
 
 #  define	__iomem		volatile
-#  define	writel		fake_writel
 
 static inline void
 fake_writel(uint32_t v, void __iomem *ptr)
@@ -149,12 +148,11 @@ void rv370_pcie_gart_set_page(struct radeon_device *rdev, unsigned i,
 	/* on x86 we want this to be CPU endian, on powerpc
 	 * on powerpc without HW swappers, it'll get swapped on way
 	 * into VRAM - so no need for cpu_to_le32 on VRAM tables */
-	writel(entry, (uint8_t __iomem *)ptr + (i * 4));
+	fake_writel(entry, (uint8_t __iomem *)ptr + (i * 4));
 }
 
 #ifdef __NetBSD__
 #  undef	__iomem
-#  undef	writel
 #endif
 
 int rv370_pcie_gart_init(struct radeon_device *rdev)
