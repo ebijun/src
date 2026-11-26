@@ -1118,11 +1118,7 @@ void r600_pcie_gart_tlb_flush(struct radeon_device *rdev)
 #ifdef __NetBSD__
 		(void)fake_readl(ptr);
 #else
-#ifdef __NetBSD__
-		(void)fake_readl(ptr);
-#else
 		(void)readl(ptr);
-#endif
 #endif
 	} else
 		WREG32(R_005480_HDP_MEM_COHERENCY_FLUSH_CNTL, 0x1);
