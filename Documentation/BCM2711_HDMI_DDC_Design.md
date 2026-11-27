@@ -4997,3 +4997,108 @@ NetBSD Linux-KPIの `include/asm/io.h` が既に `readl(addr)` を定義して�
 修正コミット: `561cab87f2f37c25c2663648dbd392f44d73b16b`。
 このコミットを含むActions run #108の完了を待ち、次のコンパイルエラーを確認する。
 この段階ではGENERIC64全体の成功を意味しない。
+
+
+## 10.35 RPi4 UEFI起動でのACPI on/off・初期コンソール比較（2026-11-27）
+
+### 10.35.1 実機と起動条件
+
+対象はPFTF UEFIを使用するRaspberry Pi 4 Model B、NetBSD 11.99.9 aarch64 GENERIC64である。起動経路の比較では、同じカーネル・同じ実機・同じHDMI/シリアル接続を使用し、EFI bootloaderの対話コマンドでACPIの有効／無効を切り替えた。
+
+GPIO UARTは3.3V USB-to-TTL変換器を使用し、次の接続で確認した。
+
+- GPIO14 / physical pin 8 (TXD0) → USB-TTL RX
+- GPIO15 / physical pin 10 (RXD0) → USB-TTL TX
+- physical pin 6 (GND) → USB-TTL GND
+- 115200 baud、8 data bits、no parity、1 stop bit、flow controlなし
+
+`config.txt` の関連設定は次のとおり。
+
+```ini
+enable_uart=1
+uart_2ndstage=1
+device_tree_address=0x3e0000
+device_tree_end=0x400000
+dtoverlay=miniuart-bt
+dtoverlay=upstream-pi4
+```
+
+`miniuart-bt` によりPL011をGPIO14/15のUARTとして使用する構成である。UEFI setupの `Device Manager → Raspberry Pi Configuration → Advanced Configuration → Preferred console` は `Serial` に設定し、設定後に再起動した。
+
+### 10.35.2 ACPI onでのコンソール確認
+
+ACPI onで起動した場合、NetBSDのコンソール出力がHDMIとシリアルの両方に表示されることを実機で確認した。
+
+この結果から、少なくとも次の要素はACPI onの起動経路で正常に機能している。
+
+- GPIO UARTの配線、電気レベルおよび端末設定
+- UEFI Preferred consoleのSerial設定
+- UEFIからNetBSDへ移行した後のシリアルコンソール出力
+- HDMI側のコンソール出力
+
+したがって、ACPI offで出力が止まる現象を、USB-TTL配線やシリアル端末設定だけの問題として説明することはできない。
+
+### 10.35.3 ACPI offでの再現ログ
+
+EFI bootloaderのプロンプトで次を実行した。
+
+```text
+> acpi off
+> boot netbsd -v
+8885616+3907544+4353004+1741020 [660340+986688+734837]=0x16160f0
+```
+
+EFI bootloaderのヘルプが示すbootコマンド形式は次のとおりである。
+
+```text
+boot [dev:][filename] [args]
+```
+
+従って、今回の `boot netbsd -v` はカーネルファイル名を指定した上で `-v` を引数として渡す形式である。ロード完了後に表示された上記の数値行は、EFI bootloaderによるカーネルイメージのロード表示である。
+
+同じACPI off起動では、HDMIとシリアルの表示は同じ内容となり、両方ともEFI bootloaderの表示までは確認できるが、カーネルロード表示の後にNetBSDカーネルの起動メッセージは現れなかった。HDMIもEFI bootloader表示のままであり、シリアルだけが無出力になる現象ではない。
+
+### 10.35.4 現時点で確定した事実
+
+| 項目 | ACPI on | ACPI off |
+|---|---|---|
+| EFI bootloader表示 | 正常 | 正常 |
+| カーネルロード | 起動成功 | ロードサイズ表示まで確認 |
+| HDMIのNetBSD console | 表示あり | NetBSD表示なし |
+| シリアルのNetBSD console | 表示あり | NetBSD表示なし |
+| HDMIとシリアルの差 | 両方表示 | 両方ともEFI表示で停止 |
+
+この比較から、ACPI offではHDMIとシリアルの両方で、NetBSDの通常のコンソール出力が始まる前に進行が見えなくなっていることが分かった。シリアル専用のconsole selectionやUART配線を最初の原因とする仮説の優先度は下がった。
+
+ただし、現時点で「CPUが停止した」「カーネルの特定関数でpanicした」とは断定できない。EFI bootloaderからカーネルへ制御が移った直後に停止している可能性と、カーネルは実行されているが初期コンソールを設定できていない可能性を区別できていない。カーネルロード表示は、カーネルの初期化が開始・完了した証拠ではない。
+
+### 10.35.5 調査対象と次の手順
+
+次の調査対象は、VC4 DRM/KMSではなく、EFI bootloaderからaarch64カーネルへの引き渡し、およびFDT-only起動時の初期化経路とする。
+
+1. `sys/stand/efiboot/boot.c`、`efifdt.c`、`exec.c` を確認し、`acpi off` 時のDTB選択、DTBアドレス、kernel entryへの引数引き渡しを追跡する。
+2. `sys/arch/aarch64/aarch64/` のEFI boot情報受け取りと初期エントリ処理を確認する。
+3. `sys/arch/evbarm/fdt/fdt_machdep.c` のFDT検証・メモリ情報取得・初期化経路を追跡する。
+4. DTBの配置先 `0x3e0000`、予約領域 `0x3e0000–0x400000`、kernel imageおよびEFI memory mapの重なりがないかを確認する。
+5. 既存のARM64 early console実装とPL011の対応をソースで確認する。GENERIC64ではEARLYCONSが無効であり、既存の `EARLYCONS=bcm2711, CONSADDR=0xfe215040` はPL011ではなくAUX mini UARTのアドレスである。PL011を使う `EARLYCONS=plcom, CONSADDR=0xfe201000` は、NetBSD側のearly console実装・初期マッピング条件を確認するまで設定しない。
+6. 必要なら、初期エントリの段階ごとにシリアルへ出力する診断用kernelを用意し、停止位置を狭める。
+
+2026年10月のNetBSD port-arm/evbarmに関する議論にも、UEFI経由でACPIなし・FDTありのaarch64起動形態が取り上げられ、FDT-only bootの扱いが課題として記録されている。ただし、この議論は今回のRPi4での停止原因を直接証明するものではない。
+
+### 10.35.6 現段階の結論と変更範囲
+
+現時点の結論は「ACPI offではEFI bootloaderによるkernel load表示の後、HDMI・シリアル双方にNetBSDカーネルメッセージが出ない。停止位置は未特定」である。
+
+次の優先作業はEFI/FDT handoffとaarch64初期化経路のソース追跡である。EARLYCONSの設定変更、GENERIC64の変更、VC4/VC5ドライバ変更はまだ行わない。カーネルの停止とコンソール未初期化を区別する診断手段を先に確立する。
+
+本節は2026-11-27時点の実機観測と調査方針の追記であり、kernel、EFI bootloader、PFTF firmware、DTB、`config.txt` の追加変更は行っていない。新たなkernel build、GitHub Actions、追加boot testも本節追記のためには実施していない。
+
+### 10.35.7 参照資料
+
+- [NetBSD EFI bootloader: boot.c](https://github.com/ebijun/src/blob/vc4-drmkms/sys/stand/efiboot/boot.c)
+- [NetBSD EFI FDT handling: efifdt.c](https://github.com/ebijun/src/blob/vc4-drmkms/sys/stand/efiboot/efifdt.c)
+- [NetBSD EFI kernel execution: exec.c](https://github.com/ebijun/src/blob/vc4-drmkms/sys/stand/efiboot/exec.c)
+- [NetBSD aarch64 machine-dependent code](https://github.com/ebijun/src/tree/vc4-drmkms/sys/arch/aarch64/aarch64)
+- [NetBSD evbarm FDT machine-dependent code](https://github.com/ebijun/src/blob/vc4-drmkms/sys/arch/evbarm/fdt/fdt_machdep.c)
+- [NetBSD GENERIC64](https://github.com/ebijun/src/blob/vc4-drmkms/sys/arch/evbarm/conf/GENERIC64)
+- [NetBSD port-arm PR 60905 / 2026-10-19](https://mail-index.netbsd.org/netbsd-bugs/2026/10/19/msg095817.html)
