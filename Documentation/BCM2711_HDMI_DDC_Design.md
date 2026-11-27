@@ -5197,3 +5197,123 @@ wsdisplay0 at genfb0 kbdmux 1: console (default, vt100 emulation)
 今後の作業では、この起動条件をACPI offの基準条件として使用する。EFI bootloaderの起動手順は `acpi off`、明示的DTB、`root=dk1` を組み合わせる。次は、必要に応じてこれらの指定を `boot.cfg` にまとめられるか確認し、シリアルコンソールで安定してログイン・診断できる状態を維持したうえでVC4 DRM/KMSのattach調査へ進む。
 
 この節は2026-11-28時点の実機起動結果とdmesgに基づく追記である。HDMI画面の乱れの原因、EFI configuration tableからのFDT取得がなぜ今回の起動条件では使えなかったか、SMP起動失敗の原因、VC4 DRM/KMSの動作は未確定であり、今回の結果だけから結論づけない。
+
+
+## 10.37 ACPI off実機のdmesg・FDT・PCIe・Wi-Fi確認（2026-11-28）
+
+### 10.37.1 取得した環境情報
+
+前節10.36の明示的DTB起動後、実機で次の情報を取得した。
+
+```text
+uname -a
+NetBSD arm64 11.99.9 NetBSD 11.99.9 (GENERIC64) #0: Thu Nov 26 06:08:44 UTC 2026
+```
+
+起動条件は、EFI bootloaderでACPIを無効にし、`hd0a:/bcm2711-rpi-4-b.dtb` を明示し、`root=dk1` を指定する方法である。今回のdmesgはこのFDT起動環境の実機ログである。
+
+### 10.37.2 FDTの内容
+
+`ofctl -p /` の結果は次のとおり。
+
+```text
+[Caching 317 nodes and 2039 properties]
+compatible = "raspberrypi,4-model-b", "brcm,bcm2711"
+model = "Raspberry Pi 4 Model B"
+```
+
+従って、今回カーネルが参照しているFDTはRaspberry Pi 4 Model B / BCM2711を示し、317 nodes、2039 propertiesを含む。これはroot nodeの表示とキャッシュ情報であり、個々のVC4/HVS/HDMIノードのstatusやregが正しいことまでを証明するものではない。表示系ノードの詳細は別途確認する。
+
+### 10.37.3 PCIeの確認
+
+dmesgでは次のattachを確認した。
+
+```text
+bcm2838pcie0 at simplebus3: Broadcom PCIE Host Controller
+pci0 at bcm2838pcie0 bus 0
+ppb0 at pci0 dev 0 function 0: vendor 14e4 product 2711
+pci1 at ppb0 bus 1
+xhci0 at pci1 dev 0 function 0: vendor 1106 product 3483
+```
+
+さらに `pcictl pci0 list` の結果は次のとおり。
+
+```text
+000:00:0: Broadcom BCM2711 PCIe Host (PCI bridge, revision 0x10)
+001:00:0: VIA Technologies VL805 xHCI (USB serial bus, xHCI, revision 0x01)
+```
+
+これにより、BCM2711 PCIe hostのattachだけでなく、downstreamのVIA VL805 xHCI controllerがPCI bus上に列挙されていることを確認した。xHCI、USB root hub、USB HID keyboard/mouseもattachしている。
+
+### 10.37.4 Wi-Fiの初期化
+
+dmesgではSDIO上にBroadcom無線LANデバイスが検出され、`bwfm(4)` のfirmware/NVRAM読み込みとchip activationが確認できた。
+
+```text
+bwfm0 at sdmmc0 function 1
+bwfm0: chip 0x00004345 rev 6
+bwfm0: Firmware file default: brcmfmac43455-sdio.bin
+bwfm0: Firmware file model-spec: brcmfmac43455-sdio.raspberrypi,4-model-b.txt
+bwfm0: Found Firmware file: brcmfmac43455-sdio.bin
+bwfm0: Found NVRAM file: brcmfmac43455-sdio.raspberrypi,4-model-b.txt
+bwfm0: CHIPACTIVE
+bwfm0: address dc:a6:32:03:31:c9
+bwfm0: wl0: Mar  1 2015 07:29:38 version 7.45.18
+```
+
+ユーザーによる追加の実機確認では、Wi-Fi経由でログインできている。dmesg自体が示すのはデバイス検出・firmware初期化までであり、無線LANのassociation、IPアドレス取得、通信経路はこの抜粋だけでは判定できない。Wi-Fi経由ログインの事実は、dmesgのfirmware初期化記録とは別の実機観測として記録する。
+
+### 10.37.5 genfbの解像度とHDMI表示
+
+今回のdmesgではSimple Framebufferが次のモードでattachしている。
+
+```text
+genfb0 at simplebus4: Simple Framebuffer (1920x1080 32-bpp @ 0x3e3cf000)
+genfb0: framebuffer at 0x3e3cf000, size 1920x1080, depth 32, stride 7680
+wsdisplay0 at genfb0 kbdmux 1: console (default, vt100 emulation)
+```
+
+前節10.36のログに記録した1920x1280とは異なり、今回のログでは1920x1080である。EFI/GOPから引き継がれるSimple Framebufferのモードは接続ディスプレイ等の条件により異なり得るため、両方の実測値を保持する。
+
+ユーザーはHDMIディスプレイを変更した後、画面表示に乱れは残るものの、文字を読める状態になったと報告している。これはディスプレイを変更した後の観測であり、表示乱れの原因を特定したものではない。今回もHDMI consoleはgenfb/wsdisplayであり、VC4 DRM/KMSのattachやKMS mode-settingを示すログはない。
+
+### 10.37.6 その他の未解決警告
+
+CPU1～CPU3は引き続き起動に失敗している。
+
+```text
+cpu1: WARNING: AP failed to start
+cpu2: WARNING: AP failed to start
+cpu3: WARNING: AP failed to start
+```
+
+また、ログにはclockのsysctl node作成失敗、regulatorのpin取得失敗、未対応FDT node等が含まれる。例として次を確認した。
+
+- `syscon1 at simplebus1: couldn't get registers`
+- `fclock2` / `fclock3` のsysctl node作成失敗（error 22）
+- `gregulator0: cannot get pin 0`
+- `/soc/fb`、`/soc/power`、`/phy`、`/scb/codec@7eb10000` がnot configured
+
+これらは今回のroot filesystem起動を妨げていないが、各デバイスの依存関係やFDT resourceの整合性を調べる際の記録として残す。
+
+### 10.37.7 現時点の判定とVC4調査への引き継ぎ
+
+| 項目 | 今回の確認結果 |
+|---|---|
+| FDT root | Raspberry Pi 4 Model B / BCM2711 |
+| FDT規模 | 317 nodes、2039 properties |
+| PCIe host | `bcm2838pcie0` attach |
+| PCIe downstream | VIA VL805 xHCI列挙 |
+| USB | xHCI、root hub、HID attach |
+| Wi-Fi | `bwfm0` firmware/NVRAM読み込み、CHIPACTIVE |
+| Wi-Fi経由ログイン | ユーザーの実機操作で成功 |
+| HDMI console | genfb/wsdisplay、1920x1080 32bpp |
+| HDMI表示品質 | ディスプレイ変更後、乱れは残るが読める状態 |
+| SMP | CPU1～3起動失敗 |
+| VC4 DRM/KMS | 今回のログではattach未確認 |
+
+ACPI off + 明示的DTB + `root=dk1` の環境で、PCIe、USB、SD、Wi-Fi、genfb consoleを含む実用的なNetBSD起動が成立している。従って、今後のVC4 DRM/KMS調査では、この起動条件を実機の基準環境として使用できる。
+
+次の調査では、FDTの `/soc` および `/scb` 以下からVC4関連ノード（HVS、pixelvalve、HDMI、DPI、DSI、VEC等）の `compatible`、`status`、`reg`、`interrupts`、`clocks`、電源・reset関連propertyを採取し、NetBSD側のFDT driver attachmentとLinux v6.0 VC4 driverの期待値を比較する。root nodeの `ofctl -p /` 結果だけでは、これら個別ノードの有効性やdriver attach条件は確定できない。
+
+本節は2026-11-28時点のユーザー提供dmesg、`ofctl -p /`、`pcictl pci0 list` およびユーザーの画面・Wi-Fi操作報告に基づく。VC4 DRM/KMSの動作、HDMI表示乱れの原因、SMP起動失敗の原因は未確定である。
