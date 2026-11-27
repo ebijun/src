@@ -2,7 +2,7 @@
 
 - 文書バージョン: 1.0
 - 作成日: 2026-11-22
-- 最終更新日: 2026-11-25
+- 最終更新日: 2026-11-28
 - 対象リポジトリ: [https://github.com/ebijun/src](https://github.com/ebijun/src)
 - 対象ブランチ: `vc4-drmkms`
 - 対象ハードウェア: Raspberry Pi 4 / BCM2711
@@ -5102,3 +5102,98 @@ boot [dev:][filename] [args]
 - [NetBSD evbarm FDT machine-dependent code](https://github.com/ebijun/src/blob/vc4-drmkms/sys/arch/evbarm/fdt/fdt_machdep.c)
 - [NetBSD GENERIC64](https://github.com/ebijun/src/blob/vc4-drmkms/sys/arch/evbarm/conf/GENERIC64)
 - [NetBSD port-arm PR 60905 / 2026-10-19](https://mail-index.netbsd.org/netbsd-bugs/2026/10/19/msg095817.html)
+
+## 10.36 RPi4 ACPI offでの明示的DTB起動とroot device固定（2026-11-28）
+
+### 10.36.1 起動条件と成功したコマンド
+
+2026-11-28、PFTF UEFIを使用するRaspberry Pi 4 Model Bで、ACPIを無効にし、EFI FATパーティション上のDTBを明示してNetBSD 11.99.9 GENERIC64を起動した。EFI bootloaderで使用したコマンドは次のとおり。
+
+```text
+acpi off
+dtb hd0a:/bcm2711-rpi-4-b.dtb
+boot netbsd-GENERIC64-108 -v root=dk1
+```
+
+この組み合わせで、以前の「カーネルロード表示後にNetBSDの起動メッセージが現れない」状態を脱し、HDMI側にカーネル起動メッセージが表示され、root filesystemのmount後まで起動が進んだ。したがって、ACPI offでの起動には明示的なDTB指定が有効であることを実機で確認した。
+
+DTBファイルは `hd0a:/bcm2711-rpi-4-b.dtb` として指定した。EFIパーティションはDOSFSであり、bootloaderの `ls` コマンドでは内容を列挙できなかったが、`dtb` コマンドによる指定とboot時の読み込みは成功した。DOSFSを `ls` できないことは、DTBファイルを読み込めないことを意味しない。
+
+### 10.36.2 root deviceの固定
+
+ACPI onで正常起動する既存環境の `mount` 出力は次のとおり。
+
+```text
+/dev/dk1 on / type ffs (noatime, local)
+/dev/dk0 on /boot type msdos (local)
+```
+
+この構成では `dk1` がNetBSD root filesystem、`dk0` がEFI/MSDOSの `/boot` partitionである。ACPI off起動ではkernel argumentに `root=dk1` を付けた。
+
+取得したdmesgには次の表示がある。
+
+```text
+boot device: dk1
+root on dk1
+root file system type: ffs
+```
+
+従って、今回の起動ではroot deviceの対話選択を必要とせず、`dk1` がrootとして選択された。以後のACPI off実機検証では、画面上のroot device選択を避けるため、`root=dk1` を起動引数に含める。
+
+### 10.36.3 FDTおよび主要デバイスの認識
+
+取得したdmesgはNetBSD 11.99.9 GENERIC64（2026-11-26 build）であり、次のデバイス認識を確認した。
+
+| 項目 | dmesgの結果 |
+|---|---|
+| FDT root | `armfdt0 (root)` |
+| Board | Raspberry Pi 4 Model B |
+| PCIe host | `bcm2838pcie0` attach成功 |
+| PCIe downstream | VL805相当のVIA xHCI controllerを列挙 |
+| USB | `xhci0`、USB root hub attach |
+| Ethernet | `genet0`、PHY attach |
+| SD/MMC | `sdhc0`、`sdhc1` attach |
+| SD card | `ld1`、約59.6GB |
+| EFI partition | `dk0`、MSDOS |
+| NetBSD root | `dk1`、FFS |
+| UART | `plcom0`（ARM PL011）および `com0`（BCM AUX UART）を検出、`com0: console` |
+| Framebuffer | `genfb0`、1920x1280、32bpp |
+| wsdisplay | `wsdisplay0` をgenfb consoleとして登録 |
+
+PCIe hostのattach、USB controllerの列挙、SD cardおよびroot filesystemの認識まで進んだことから、明示的DTBによるFDT-only起動経路で、少なくともこれらの主要なplatform deviceが動作することを確認した。
+
+一方、CPU1～CPU3は `WARNING: AP failed to start` と表示され、disabledになっている。SMP起動は未解決事項として残す。また、clock sysctl作成、regulator pin取得などのautoconfiguration warningも記録されているが、今回のroot mount成功を妨げてはいない。
+
+### 10.36.4 HDMI framebuffer表示の状態
+
+dmesgではEFIが用意したSimple Framebufferを次のように認識している。
+
+```text
+genfb0 at simplebus4: Simple Framebuffer (1920x1280 32-bpp @ 0x3e267000)
+genfb0: framebuffer at 0x3e267000, size 1920x1280, depth 32, stride 7680
+wsdisplay0 at genfb0 kbdmux 1: console (default, vt100 emulation)
+```
+
+この起動時のHDMI consoleは `genfb` / `wsdisplay` 経由である。今回のdmesgにはVC4 DRM/KMS driverのattachやKMS mode-setting成功を示す記録はない。従って、今回確認できたHDMI表示はVC4 DRM/KMSによる表示ではなく、firmware提供のSimple Framebufferを使った表示である。
+
+実機ではroot device選択付近でHDMI画面の文字・表示が乱れるという観測がある。ただし、ディスプレイまたはHDMI経路側の問題である可能性もあり、現時点でNetBSD `genfb` の不具合とは断定しない。シリアルコンソールを診断・操作用の基準経路として維持し、別ディスプレイやケーブルでの比較を今後の確認項目とする。
+
+### 10.36.5 現時点の判定と次の作業
+
+| 項目 | 判定 |
+|---|---|
+| ACPI off | 実機起動成功 |
+| EFI FAT上の明示的DTB指定 | 成功 |
+| NetBSD 11.99.9 GENERIC64起動 | root mountまで成功 |
+| `root=dk1` | root device自動選択を確認 |
+| FDT root / Raspberry Pi 4識別 | 成功 |
+| BCM2711 PCIe host attach | 成功 |
+| USB xHCI attach | 成功 |
+| SD card / dk1 root | 成功 |
+| genfb / wsdisplay console | 登録成功、画面品質は未確定 |
+| SMP CPU1～3 | 起動失敗、未解決 |
+| VC4 DRM/KMS | このログでは未確認 |
+
+今後の作業では、この起動条件をACPI offの基準条件として使用する。EFI bootloaderの起動手順は `acpi off`、明示的DTB、`root=dk1` を組み合わせる。次は、必要に応じてこれらの指定を `boot.cfg` にまとめられるか確認し、シリアルコンソールで安定してログイン・診断できる状態を維持したうえでVC4 DRM/KMSのattach調査へ進む。
+
+この節は2026-11-28時点の実機起動結果とdmesgに基づく追記である。HDMI画面の乱れの原因、EFI configuration tableからのFDT取得がなぜ今回の起動条件では使えなかったか、SMP起動失敗の原因、VC4 DRM/KMSの動作は未確定であり、今回の結果だけから結論づけない。
